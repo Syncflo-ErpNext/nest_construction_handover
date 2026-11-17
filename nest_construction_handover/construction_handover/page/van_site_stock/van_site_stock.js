@@ -88,6 +88,7 @@ function ch_call(method, args, freeze) {
 
 // The four ways stock is handed over, and what each needs.
 var CH_SENDS = {
+	'book': { title: __('Book stock to a site'), to: 'sites', book: true },
 	'to-van': { title: __('Send to a van'), to: 'vans', into_van: true, project: true },
 	'to-site': { title: __('Deliver to a site'), to: 'sites', out_of_van: true },
 	'to-store': { title: __('Back to the store'), to: 'stores', out_of_van: true },
@@ -123,18 +124,20 @@ class ChStock {
 		if (this.ctx && this.screen === 'home') this.refresh_inbox();
 	}
 
-	// van-site-stock/send-van, /deliver, /return-store, /return-van, /used, /stock, /find,
-	// /recent opens that screen (home tiles link here).
+	// van-site-stock/book, /send-van, /deliver, /return-store, /return-van, /used, /receive,
+	// /stock, /find, /recent opens that screen (home tiles link here).
 	open_route() {
 		this.go((frappe.get_route() || [])[1] || 'home');
 	}
 
 	go(where) {
-		if (where === 'send-van') this.send('to-van');
+		if (where === 'book') this.send('book');
+		else if (where === 'send-van') this.send('to-van');
 		else if (where === 'deliver') this.send('to-site');
 		else if (where === 'return-store') this.send('to-store');
 		else if (where === 'return-van') this.send('site-to-van');
 		else if (where === 'used') this.use();
+		else if (where === 'receive') this.receive();
 		else if (where === 'stock') this.my_stock();
 		else if (where === 'find') this.find();
 		else if (where === 'recent') this.recent();
@@ -347,7 +350,8 @@ class ChStock {
 
 		var tiles = [];
 		if (kind === 'store') {
-			tiles.push(this.tile('send-van', 'truck', __('Send to a van'), __('Load a van from the store')));
+			tiles.push(this.tile('book', 'clipboard-text', __('Book stock to a site'), __('List what is going to a site')));
+			tiles.push(this.tile('send-van', 'truck', __('Send to a van'), __('Van stock: load a van from the store')));
 			tiles.push(this.tile('stock', 'package', __('In the store'), __('What is on the shelves')));
 		} else if (kind === 'van') {
 			tiles.push(this.tile('deliver', 'map-pin', __('Deliver to a site'), __('Hand stock over at a site')));
@@ -358,6 +362,9 @@ class ChStock {
 			tiles.push(this.tile('used', 'wrench', __('Used on site'), __('Record what was fitted; it costs the job')));
 			tiles.push(this.tile('return-van', 'truck', __('Back on a van'), __('Send stock off site')));
 			tiles.push(this.tile('stock', 'package', __('On site now'), __('What is in the site store')));
+		}
+		if (kind !== 'store' && (ctx.receive_at || []).length) {
+			tiles.push(this.tile('receive', 'receipt', __('Supplier delivery'), __('Book in what a supplier brought to site')));
 		}
 		tiles.push(this.tile('find', 'magnifying-glass', __('Find stock'), __('How much is there, and where')));
 
@@ -370,6 +377,7 @@ class ChStock {
 			'  </div>',
 			'</div>',
 			'<div data-incoming></div>',
+			'<div data-bookings></div>',
 			this.scan_box(__('Scan or type an item to find it')),
 			'<div data-results></div>',
 			'<div class="ch-menu">' + tiles.join('\n') + '</div>',
@@ -385,6 +393,80 @@ class ChStock {
 		this.bind_scan((term) => this.home_scan(term));
 		this.paint_inbox();
 		this.refresh_inbox();
+		if (kind === 'store') this.paint_bookings();
+	}
+
+	// Booked to a site, not issued to a van yet: tap one to issue it.
+	paint_bookings() {
+		ch_call('bookings').then((list) => {
+			if (this.screen !== 'home') return;
+			var $box = this.$root.find('[data-bookings]');
+			$box.html(list.length ? [
+				'<div class="ch-waiting">',
+				'  <div class="ch-waiting-head">' + ch_icon('clipboard-text') + ch_esc(list.length === 1 ? __('1 booking to issue to a van') : __('{0} bookings to issue to a van', [list.length])) + '</div>',
+				'  <div class="ch-list">',
+				list.map((b) => this.row(
+					'data-booking="' + ch_esc(b.name) + '"',
+					ch_esc(__('For {0}', [b.site])),
+					ch_esc([b.name, ch_lines(b.lines.length), b.by, ch_when(b.at)].join(' · ')),
+					this.tag(__('Issue'), 'go')
+				)).join('\n'),
+				'  </div>',
+				'</div>'
+			].join('\n') : '');
+			$box.find('[data-booking]').on('click', (e) => {
+				var name = $(e.currentTarget).attr('data-booking');
+				this.issue_booking(list.filter(function(b) { return b.name === name; })[0]);
+			});
+		});
+	}
+
+	// Issue a booking to a van exactly as booked: pick the van, tap Issue.
+	issue_booking(b) {
+		var vans = this.ctx.vans;
+		var kept = ch_remembered('issue:van');
+		this.to = vans.some(function(v) { return v.name === kept; }) ? kept : (vans.length === 1 ? vans[0].name : '');
+		this.docket_id = frappe.utils.get_random(20);
+		this.render([
+			this.head(__('For {0}', [b.site]), b.name, true),
+			'<div class="ch-card">',
+			[[__('Site'), b.site], b.project ? [__('Project'), b.project_name || b.project] : null, [__('Booked by'), b.by + ' · ' + ch_when(b.at)]]
+				.filter(Boolean).map(function(f) { return '<div class="ch-fact"><span>' + ch_esc(f[0]) + '</span><b>' + ch_esc(f[1]) + '</b></div>'; }).join('\n'),
+			'</div>',
+			'<div class="ch-section">' + __('Going') + '</div>',
+			'<div class="ch-list">',
+			b.lines.map((l) => [
+				'<div class="ch-row ch-row-static">',
+				'  <span class="ch-row-main">' + ch_esc(l.item_code) + '</span>',
+				'  <span class="ch-row-sub">' + ch_esc(l.item_name || '') + '</span>',
+				'  <span class="ch-row-right">' + ch_qty(l.to_go) + ' ' + ch_esc(l.uom || '') + (l.to_go < l.booked ? '<br><span class="ch-dim">' + ch_esc(__('of {0} booked', [ch_qty(l.booked)])) + '</span>' : '') + '</span>',
+				'</div>'
+			].join('\n')).join('\n'),
+			'</div>',
+			this.place_field('to', __('Van'), vans, this.to, __('Choose the van')),
+			'<div class="ch-actions"><button class="ch-submit" data-issue="1">' + ch_icon('paper-plane-tilt') + '<span data-issue-label></span></button></div>'
+		].join('\n'), 'issue');
+		this.bind_back(() => this.home());
+		var label = () => {
+			var van = this.place(this.to);
+			this.$root.find('[data-issue]').prop('disabled', !van);
+			this.$root.find('[data-issue-label]').text(van ? __('Issue to {0}', [van.label + (van.driver ? ' · ' + van.driver : '')]) : __('Choose the van first'));
+		};
+		this.$root.find('[data-side]').on('change', (e) => {
+			this.to = $(e.currentTarget).val();
+			ch_remember('issue:van', this.to);
+			label();
+		});
+		label();
+		this.$root.find('[data-issue]').on('click', () => {
+			var van = this.place(this.to);
+			if (!van) return;
+			ch_call('issue', { booking: b.name, van: van.name, docket_id: this.docket_id }, true).then((r) => {
+				this.done(__('Issued to {0}', [van.label]), r.name + ' · ' + __('nothing moves until the driver counts it and accepts'), [
+					{ label: __('Home'), primary: true, fn: () => this.home() }
+				]);
+			});
+		});
 	}
 
 	refresh_inbox() {
@@ -480,7 +562,7 @@ class ChStock {
 	targets(how) {
 		var from = this.place(this.from);
 		var company = from && from.company;
-		return (this.ctx[how.to] || []).filter((p) => p.name !== this.from && (!company || !p.company || p.company === company));
+		return (this.ctx[how.to] || []).filter((p) => p.name !== this.from && (!company || !p.company || p.company === company) && (!how.book || p.project));
 	}
 
 	paint_send(how) {
@@ -541,16 +623,16 @@ class ChStock {
 		});
 		this.$root.find('[data-record]').on('click', () => this.record_send(how));
 		this.paint_route_note(how);
-		this.paint_basket(__('Send {0}'));
+		this.paint_basket(how.book ? __('Book {0}') : __('Send {0}'));
 	}
 
 	paint_route_note(how) {
 		var target = this.place(this.to);
 		var note = '';
-		if (how.into_van && target) {
-			note = this.project
-				? __('Project stock: everything goes into {0} · Goods In Transit.', [target.label])
-				: __('Choose which part of {0} each item goes in.', [target.label]);
+		if (how.book) {
+			note = __('Booked stock stays in the store until it is issued to a van.');
+		} else if (how.into_van && target) {
+			note = __('The driver chooses which part of {0} each item goes in.', [target.label]);
 		}
 		this.$root.find('[data-route-note]').html(note ? '<div class="ch-hint">' + ch_icon('info') + ch_esc(note) + '</div>' : '');
 	}
@@ -654,15 +736,13 @@ class ChStock {
 			});
 		};
 
-		// Into a van without a project: which compartment, defaulting to where it went last time.
-		if (how.into_van && !this.project) ch_call('last_compartment', { item_code: item.item_code }).then(ask);
-		else ask(null);
+		// Into a van the driver chooses the compartment when accepting, so nothing to pick here.
+		ask(null);
 	}
 
 	paint_basket(label) {
 		if (label) this.record_label = label;
 		var $basket = this.$root.find('[data-basket]');
-		var project = this.project;
 		if (!this.basket.length) {
 			$basket.html('<div class="ch-note">' + __('Nothing added yet. Scan an item, or tap one above.') + '</div>');
 		} else {
@@ -670,7 +750,6 @@ class ChStock {
 				var where = [];
 				var cat = this.compartment(r.s_warehouse);
 				if (cat) where.push(__('from {0}', [cat]));
-				if (this.kind && CH_SENDS[this.kind] && CH_SENDS[this.kind].into_van) where.push(__('into {0}', [project ? 'Goods In Transit' : (r.t_category || 'Van Stock')]));
 				return [
 					'<div class="ch-row ch-row-static">',
 					'  <span class="ch-row-main">' + ch_esc(r.item_code) + '</span>',
@@ -693,6 +772,19 @@ class ChStock {
 	record_send(how) {
 		if (!this.from || !this.to) { this.say(__('Choose where the goods come from and where they go.'), 'red'); return; }
 		var target = this.place(this.to);
+		if (how.book) {
+			ch_call('book', {
+				store: this.from,
+				site: this.to,
+				rows: JSON.stringify(this.basket.map(function(r) { return { item_code: r.item_code, qty: r.qty }; }))
+			}, true).then((r) => {
+				this.done(__('Booked for {0}', [target.label]), r.name + ' · ' + __('it stays in the store until it is issued to a van'), [
+					{ label: __('Book more'), primary: true, fn: () => this.send('book') },
+					{ label: __('Home'), fn: () => this.home() }
+				]);
+			});
+			return;
+		}
 		ch_call('send', {
 			from_location: this.from,
 			to_location: this.to,
@@ -716,15 +808,25 @@ class ChStock {
 	review(name) {
 		ch_call('docket', { name: name }).then((d) => {
 			this.counted = {};
-			d.lines.forEach((l) => { this.counted[l.row] = l.sent; });
+			this.put = {};
+			d.lines.forEach((l) => {
+				this.counted[l.row] = l.sent;
+				this.put[l.row] = l.put || '';
+			});
 			this.paint_review(d);
 		});
+	}
+
+	// The parts of the van the driver can put stock in, in the screen's usual order.
+	van_parts(d) {
+		return CH_COMPARTMENTS.filter(function(c) { return (d.compartments || []).indexOf(c) !== -1; });
 	}
 
 	paint_review(d) {
 		var facts = [
 			[__('From'), d.from],
 			[__('To'), d.to],
+			d.booked_for ? [__('Booked for'), d.booked_for] : null,
 			d.project ? [__('Project'), d.project_name || d.project] : null,
 			[__('Sent by'), d.by + ' · ' + ch_when(d.at)],
 			d.received_by ? [__('Accepted by'), d.received_by + ' · ' + ch_when(d.received_at)] : null,
@@ -740,7 +842,15 @@ class ChStock {
 			facts.map(function(f) { return '<div class="ch-fact"><span>' + ch_esc(f[0]) + '</span><b>' + ch_esc(f[1]) + '</b></div>'; }).join('\n'),
 			d.notes ? '<div class="ch-notes">' + ch_esc(d.notes).replace(/\n/g, '<br>') + '</div>' : '',
 			'</div>',
-			'<div class="ch-section">' + (d.can_accept ? __('Count what arrived (tap a line to change it)') : __('What was sent')) + '</div>',
+			d.can_accept && d.into_van ? [
+				'<label class="ch-label">' + __('Put it all in'),
+				'  <select class="ch-select" data-put-all="1">',
+				'    <option value="">' + __('Choose a part of the van') + '</option>',
+				this.van_parts(d).map(function(c) { return '<option value="' + ch_esc(c) + '">' + ch_esc(c) + '</option>'; }).join('\n'),
+				'  </select>',
+				'</label>'
+			].join('\n') : '',
+			'<div class="ch-section">' + (d.can_accept ? (d.into_van ? __('Count what arrived and where it goes (tap a line to change it)') : __('Count what arrived (tap a line to change it)')) : __('What was sent')) + '</div>',
 			'<div class="ch-list" data-lines></div>',
 			d.can_accept ? '<label class="ch-label">' + __('Note (optional)') + '<input class="ch-text" data-note="1" autocomplete="off"></label>' : '',
 			d.can_accept ? '<button class="ch-secondary ch-quiet" data-reject="1">' + ch_icon('prohibit') + __('Turn it down') + '</button>' : '',
@@ -750,6 +860,12 @@ class ChStock {
 
 		this.bind_back(() => this.home());
 		this.paint_lines(d);
+		this.$root.find('[data-put-all]').on('change', (e) => {
+			var part = $(e.currentTarget).val();
+			if (!part) return;
+			d.lines.forEach((l) => { this.put[l.row] = part; });
+			this.paint_lines(d);
+		});
 		this.$root.find('[data-accept]').on('click', () => this.accept(d));
 		this.$root.find('[data-reject]').on('click', () => this.reject(d));
 		this.$root.find('[data-withdraw]').on('click', () => this.withdraw(d));
@@ -757,19 +873,24 @@ class ChStock {
 
 	paint_lines(d) {
 		var counted = this.counted;
+		var put = this.put || {};
+		var choosing = d.can_accept && d.into_van;
 		var $lines = this.$root.find('[data-lines]');
 		$lines.html(d.lines.map((l) => {
 			// Only a van's compartments are worth saying per line; the rest is on the card.
 			var where = [];
 			if (this.is_compartment(l.from)) where.push(__('from {0}', [this.compartment_of(l.from)]));
-			if (this.is_compartment(l.to)) where.push(__('into {0}', [this.compartment_of(l.to)]));
+			if (choosing) where.push(put[l.row] ? __('into {0}', [put[l.row]]) : __('where does it go?'));
+			else if (this.is_compartment(l.to)) where.push(__('into {0}', [this.compartment_of(l.to)]));
 			var sub = ch_esc(where.concat([l.item_name]).filter(Boolean).join(' · '));
 			var right;
 			if (d.can_accept) {
 				var n = flt(counted[l.row]);
-				right = n === flt(l.sent)
-					? this.tag(__('All {0}', [ch_qty(l.sent) + ' ' + (l.uom || '')]), 'good')
-					: this.tag(__('{0} of {1}', [ch_qty(n), ch_qty(l.sent)]), 'warn');
+				right = choosing && n > 0 && !put[l.row]
+					? this.tag(__('Choose where'), 'warn')
+					: (n === flt(l.sent)
+						? this.tag(__('All {0}', [ch_qty(l.sent) + ' ' + (l.uom || '')]), 'good')
+						: this.tag(__('{0} of {1}', [ch_qty(n), ch_qty(l.sent)]), 'warn'));
 			} else if (d.status === 'Posted') {
 				right = flt(l.received) === flt(l.sent) ? ch_qty(l.sent) + ' ' + ch_esc(l.uom || '') : this.tag(__('{0} of {1}', [ch_qty(l.received), ch_qty(l.sent)]), 'warn');
 			} else {
@@ -787,18 +908,24 @@ class ChStock {
 					max_text: __('Only {0} was sent. Ask for the extra to be sent on its own.', [ch_qty(l.sent)]),
 					info: ch_esc(__('{0} {1} sent.', [ch_qty(l.sent), l.uom || ''])),
 					allow_zero: true,
-					action: __('Set')
-				}, (qty) => {
+					action: __('Set'),
+					// Into a van the driver says where it goes; blank until they choose.
+					put: choosing ? [{ value: '', label: __('Choose a part of the van') }].concat(this.van_parts(d).map(function(c) { return { value: c, label: c }; })) : null,
+					put_default: put[l.row] || ''
+				}, (qty, values) => {
 					counted[l.row] = qty;
+					if (choosing && values.put) put[l.row] = values.put;
 					this.paint_lines(d);
 				});
 			});
 			var short = d.lines.filter(function(l) { return flt(counted[l.row]) < flt(l.sent); }).length;
 			var arrived = d.lines.filter(function(l) { return flt(counted[l.row]) > 0; }).length;
-			this.$root.find('[data-accept]').prop('disabled', !arrived);
+			var unplaced = choosing ? d.lines.filter(function(l) { return flt(counted[l.row]) > 0 && !put[l.row]; }).length : 0;
+			this.$root.find('[data-accept]').prop('disabled', !arrived || unplaced > 0);
 			this.$root.find('[data-accept-label]').text(!arrived
 				? __('Nothing counted in')
-				: (short ? __('Accept, {0} short', [short === 1 ? __('1 line') : __('{0} lines', [short])]) : __('Accept {0}', [ch_lines(d.lines.length)])));
+				: (unplaced ? __('Choose where {0} goes', [unplaced === 1 ? __('1 line') : __('{0} lines', [unplaced])])
+					: (short ? __('Accept, {0} short', [short === 1 ? __('1 line') : __('{0} lines', [short])]) : __('Accept {0}', [ch_lines(d.lines.length)]))));
 		}
 	}
 
@@ -816,6 +943,7 @@ class ChStock {
 		ch_call('accept', {
 			name: d.name,
 			counted: JSON.stringify(this.counted),
+			put: d.into_van ? JSON.stringify(this.put || {}) : '',
 			notes: this.$root.find('[data-note]').val() || ''
 		}, true).then((r) => {
 			this.done(__('Accepted into {0}', [d.to]), r.stock_entry + ' · ' + d.name, [
@@ -967,6 +1095,99 @@ class ChStock {
 			else this.basket.push({ item_code: item.item_code, item_name: item.item_name, stock_uom: uom, qty: qty, s_warehouse: this.from });
 			this.paint_basket();
 		});
+	}
+
+	// ---- supplier deliveries on site ---------------------------------------
+
+	receive() {
+		var names = this.ctx.receive_at || [];
+		var sites = this.ctx.sites.filter(function(s) { return names.indexOf(s.name) !== -1; });
+		if (sites.length === 1) { this.deliveries_at(sites[0]); return; }
+		this.pick_site(__('Supplier delivery'), sites, (site) => this.deliveries_at(site));
+	}
+
+	deliveries_at(site) {
+		ch_remember('site', site.name);
+		ch_call('deliveries', { site: site.name }).then((orders) => {
+			this.render([
+				this.head(__('Supplier delivery'), this.site_name(site), true),
+				orders.length ? '<div class="ch-section">' + __('Orders still to arrive') + '</div>' : '',
+				orders.length ? '<div class="ch-list">' + orders.map((o) => this.row(
+					'data-po="' + ch_esc(o.name) + '"',
+					ch_esc(o.supplier),
+					ch_esc([o.name, ch_lines(o.lines.length), o.due ? __('due {0}', [frappe.datetime.str_to_user(o.due)]) : ''].filter(Boolean).join(' · ')),
+					this.tag(__('Count'), 'go')
+				)).join('\n') + '</div>' : '<div class="ch-note">' + __('No approved orders are waiting to arrive at this site.') + '</div>'
+			].join('\n'), 'deliveries');
+			this.bind_back(() => this.home());
+			this.$root.find('[data-po]').on('click', (e) => {
+				var name = $(e.currentTarget).attr('data-po');
+				this.count_delivery(site, orders.filter(function(o) { return o.name === name; })[0]);
+			});
+		});
+	}
+
+	count_delivery(site, o) {
+		this.counted = {};
+		o.lines.forEach((l) => { this.counted[l.row] = l.pending; });
+		this.render([
+			this.head(o.supplier, o.name, true),
+			'<div class="ch-section">' + __('Count what arrived (tap a line to change it)') + '</div>',
+			'<div class="ch-list" data-lines></div>',
+			'<label class="ch-label">' + __('Supplier delivery note number (optional)') + '<input class="ch-text" data-dn="1" autocomplete="off"></label>',
+			'<div class="ch-actions"><button class="ch-submit" data-book="1">' + ch_icon('check') + '<span data-book-label></span></button></div>'
+		].join('\n'), 'delivery');
+		this.bind_back(() => this.deliveries_at(site));
+		this.paint_delivery(o);
+		this.$root.find('[data-book]').on('click', () => {
+			var counted = this.counted;
+			var rows = o.lines.filter(function(l) { return flt(counted[l.row]) > 0; }).map(function(l) {
+				return { po_detail: l.row, qty: counted[l.row] };
+			});
+			ch_call('receive', {
+				purchase_order: o.name,
+				rows: JSON.stringify(rows),
+				delivery_note: this.$root.find('[data-dn]').val() || ''
+			}, true).then((r) => {
+				this.done(__('Booked into {0}', [site.label]), r.name + ' · ' + o.name, [
+					{ label: __('Another delivery'), primary: true, fn: () => this.deliveries_at(site) },
+					{ label: __('Home'), fn: () => this.home() }
+				]);
+			});
+		});
+	}
+
+	paint_delivery(o) {
+		var counted = this.counted;
+		var $lines = this.$root.find('[data-lines]');
+		$lines.html(o.lines.map((l) => {
+			var n = flt(counted[l.row]);
+			var right = n === flt(l.pending)
+				? this.tag(__('All {0}', [ch_qty(l.pending) + ' ' + (l.uom || '')]), 'good')
+				: this.tag(__('{0} of {1}', [ch_qty(n), ch_qty(l.pending)]), 'warn');
+			return this.row('data-line="' + ch_esc(l.row) + '"', ch_esc(l.item_code), ch_esc(l.item_name || ''), right);
+		}).join('\n'));
+		$lines.find('[data-line]').on('click', (e) => {
+			var l = o.lines.filter(function(x) { return x.row === $(e.currentTarget).attr('data-line'); })[0];
+			this.ask(l, {
+				label: __('How many arrived?'),
+				default: counted[l.row],
+				max: l.pending,
+				max_text: __('Only {0} is still to come on this order. The office books in any extra.', [ch_qty(l.pending)]),
+				info: ch_esc(__('{0} {1} still to come.', [ch_qty(l.pending), l.uom || ''])),
+				allow_zero: true,
+				action: __('Set')
+			}, (qty) => {
+				counted[l.row] = qty;
+				this.paint_delivery(o);
+			});
+		});
+		var short = o.lines.filter(function(l) { return flt(counted[l.row]) < flt(l.pending); }).length;
+		var arrived = o.lines.filter(function(l) { return flt(counted[l.row]) > 0; }).length;
+		this.$root.find('[data-book]').prop('disabled', !arrived);
+		this.$root.find('[data-book-label]').text(!arrived
+			? __('Nothing counted in')
+			: (short ? __('Book in, {0} short', [short === 1 ? __('1 line') : __('{0} lines', [short])]) : __('Book in {0}', [ch_lines(o.lines.length)])));
 	}
 
 	// ---- what is here ------------------------------------------------------

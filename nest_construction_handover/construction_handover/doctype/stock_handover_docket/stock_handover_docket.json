@@ -19,6 +19,7 @@
   "direction",
   "project",
   "site_label",
+  "material_request",
   "sb_items",
   "items",
   "sb_sig",
@@ -124,6 +125,15 @@
    "read_only": 1
   },
   {
+   "description": "The booking (Material Request) this handover issued to a van.",
+   "fieldname": "material_request",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "Booking",
+   "options": "Material Request",
+   "read_only": 1
+  },
+  {
    "fieldname": "sb_items",
    "fieldtype": "Section Break",
    "label": "Items"
@@ -216,7 +226,7 @@
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-08-31 08:00:00.000000",
+ "modified": "2026-11-17 15:00:00.000000",
  "modified_by": "Administrator",
  "module": "Construction Handover",
  "name": "Stock Handover Docket",

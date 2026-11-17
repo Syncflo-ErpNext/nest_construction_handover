@@ -6,7 +6,8 @@ Three kinds of people use it, told apart by the warehouse on their user
     Main Store   the storeman: sends to vans, takes returns back in
     Van          a technician: delivers to sites, brings stock back, records
                  what was used on site
-    Site Store   a site: records what was used, sends returns back on a van.
+    Site Store   a site: records what was used, sends returns back on a van,
+                 books in supplier deliveries against the site's purchase orders.
                  A site manager also works every site they manage (Project Site).
 
 A handover is a Stock Handover Docket. The giver lists what is going and the
@@ -23,7 +24,7 @@ import json
 
 import frappe
 from frappe import _
-from frappe.utils import flt, get_fullname, now_datetime
+from frappe.utils import flt, get_fullname, now_datetime, nowdate
 
 DOCKET = "Stock Handover Docket"
 DOCKET_ITEM = "Stock Handover Docket Item"
@@ -358,6 +359,7 @@ def bootstrap():
 		"projects": projects,
 		"pickable": PICKABLE,
 		"purchasing": bool(me.roles & PURCHASING_ROLES) and "nest_po_management" in frappe.get_installed_apps(),
+		"receive_at": _receiving_sites(me),
 		"inbox": _inbox(me),
 	}
 
@@ -424,11 +426,21 @@ def docket(name):
 	if not (receives or gives):
 		frappe.throw(_("{0} is not to or from you.").format(name), frappe.PermissionError)
 	labels = _labels(me.places)
+	# Into a van the driver picks the compartment per line: say which there are and
+	# what each line is set to now (blank when issued from a booking).
+	van = me.places.get(doc.to_warehouse) if me.places.get(doc.to_warehouse, {}).get("kind") == "van" else None
+	compartments = (van or {}).get("compartments") or {}
+	category_of = {leaf: category for category, leaf in compartments.items()}
+	booked_for = frappe.db.get_value("Material Request", doc.material_request, "set_warehouse") if doc.material_request else None
 	return {
 		"name": doc.name,
 		"status": doc.status,
 		"from": labels.get(doc.from_warehouse, doc.from_warehouse),
 		"to": labels.get(doc.to_warehouse, doc.to_warehouse),
+		"into_van": bool(van),
+		"compartments": list(compartments),
+		"booking": doc.material_request,
+		"booked_for": labels.get(booked_for, booked_for) if booked_for else None,
 		"project": doc.project,
 		"project_name": frappe.db.get_value("Project", doc.project, "project_name") if doc.project else None,
 		"by": get_fullname(doc.given_by),
@@ -449,6 +461,7 @@ def docket(name):
 				"received": flt(item.qty_received),
 				"from": labels.get(item.s_warehouse) if item.s_warehouse else None,
 				"to": labels.get(item.t_warehouse) if item.t_warehouse else None,
+				"put": category_of.get(item.t_warehouse),
 			}
 			for item in doc.items
 		],
@@ -666,8 +679,12 @@ def hub():
 
 
 def _approves(user):
-	"""A site manager or project manager approves purchases on their sites and projects."""
-	if any(site.get("site_manager") == user for site in _sites().values()):
+	"""A site manager or project manager approves purchases on their sites and projects.
+	Site managers only while PO Management Settings has a Site Manager tier."""
+	site_tier = frappe.db.exists(
+		"PO Approval Tier", {"parent": "PO Management Settings", "approver_type": "Site Manager"}
+	)
+	if site_tier and any(site.get("site_manager") == user for site in _sites().values()):
 		return True
 	return frappe.get_meta("Project").has_field("po_project_manager") and bool(
 		frappe.db.exists("Project", {"po_project_manager": user, "status": "Open"})
@@ -682,9 +699,9 @@ def send(from_location, to_location, rows, project=None, notes=None, docket_id=N
 	"""List what is being handed over. Nothing moves until the other end accepts.
 
 	Lines leaving a van name the compartment they come out of. Lines going into a
-	van name a category (Tools, Assets, Van Stock); project stock always goes into
-	the van's Goods In Transit. `docket_id` comes from the phone, so a second tap
-	on Send returns the first docket instead of making another.
+	van name none: the driver chooses the compartment when accepting. `docket_id`
+	comes from the phone, so a second tap on Send returns the first docket instead
+	of making another.
 	"""
 	me = _me()
 	if docket_id:
@@ -715,7 +732,6 @@ def send(from_location, to_location, rows, project=None, notes=None, docket_id=N
 	rows = _rows(rows)
 	items = _usable([row["item_code"] for row in rows])
 	source_compartments = set((source.get("compartments") or {}).values())
-	target_compartments = target.get("compartments") or {}
 
 	lines = []
 	for row in rows:
@@ -727,15 +743,8 @@ def send(from_location, to_location, rows, project=None, notes=None, docket_id=N
 		else:
 			s_warehouse = from_location
 
-		if target["kind"] == "van":
-			category = TRANSIT if project else row.get("t_category")
-			if category not in PICKABLE and category != TRANSIT:
-				category = DEFAULT_COMPARTMENT
-			t_warehouse = target_compartments.get(category)
-			if not t_warehouse:
-				frappe.throw(_("{0} has no {1} warehouse.").format(target["label"], category))
-		else:
-			t_warehouse = to_location
+		# Into a van the driver chooses the compartment when accepting.
+		t_warehouse = None if target["kind"] == "van" else to_location
 
 		lines.append(
 			{
@@ -766,6 +775,202 @@ def send(from_location, to_location, rows, project=None, notes=None, docket_id=N
 	return {"name": doc.name}
 
 
+# ---- bookings: stock booked to a site, then issued to a van -------------------
+#
+# A booking is a Material Request (transfer, main store to the site store, on the
+# site's project) captured once. Issuing it to a van makes a handover from its lines
+# as booked; the driver counts it and picks where in the van each line goes.
+
+
+def _issued(bookings):
+	"""Material Request Item -> how much has gone out on van handovers. An open
+	handover counts what was sent; an accepted one what was counted in."""
+	if not bookings:
+		return {}
+	rows = frappe.db.sql(
+		"""
+		select i.material_request_item as line, d.status, sum(i.qty_sent) as sent, sum(i.qty_received) as received
+		from `tabStock Handover Docket Item` i
+		inner join `tabStock Handover Docket` d on d.name = i.parent
+		where d.material_request in %(bookings)s and d.status in ('Open', 'Complete', 'Posted')
+		group by i.material_request_item, d.status
+		""",
+		{"bookings": tuple(bookings)},
+		as_dict=True,
+	)
+	issued = {}
+	for row in rows:
+		issued[row.line] = issued.get(row.line, 0) + flt(row.received if row.status == "Posted" else row.sent)
+	return issued
+
+
+def _bookings(me, names=None):
+	"""Bookings from my store with something still to issue, newest first."""
+	stores = [name for name in me.mine if me.places[name]["kind"] == "store"]
+	if not stores:
+		return []
+	filters = {
+		"docstatus": 1,
+		"material_request_type": "Material Transfer",
+		"set_from_warehouse": ["in", stores],
+		"status": ["not in", ["Stopped", "Cancelled"]],
+	}
+	if names:
+		filters["name"] = ["in", names]
+	heads = frappe.get_all(
+		"Material Request",
+		filters=filters,
+		fields=["name", "set_from_warehouse", "set_warehouse", "owner", "creation"],
+		order_by="creation desc",
+		limit=50,
+	)
+	if not heads:
+		return []
+	lines = frappe.get_all(
+		"Material Request Item",
+		filters={"parenttype": "Material Request", "parent": ["in", [h.name for h in heads]]},
+		fields=["name", "parent", "item_code", "item_name", "stock_uom", "stock_qty"],
+		order_by="parent asc, idx asc",
+	)
+	issued = _issued([h.name for h in heads])
+	labels = _labels(me.places)
+	out = []
+	for head in heads:
+		rows = [
+			{
+				"row": line.name,
+				"item_code": line.item_code,
+				"item_name": line.item_name,
+				"uom": line.stock_uom,
+				"booked": flt(line.stock_qty),
+				"to_go": flt(line.stock_qty) - issued.get(line.name, 0),
+			}
+			for line in lines
+			if line.parent == head.name
+		]
+		rows = [row for row in rows if row["to_go"] > EPSILON]
+		if not rows:
+			continue
+		site = me.places.get(head.set_warehouse) or {}
+		out.append(
+			{
+				"name": head.name,
+				"from": head.set_from_warehouse,
+				"site_store": head.set_warehouse,
+				"site": site.get("label") or labels.get(head.set_warehouse, head.set_warehouse),
+				"project": site.get("project"),
+				"project_name": site.get("project_name"),
+				"by": get_fullname(head.owner),
+				"at": head.creation,
+				"lines": rows,
+			}
+		)
+	return out
+
+
+@frappe.whitelist()
+def bookings():
+	"""Stock booked to sites from my store and not yet issued to a van."""
+	return _bookings(_me())
+
+
+@frappe.whitelist()
+def book(store, site, rows):
+	"""Book stock in the store to a site: the list is captured once and kept as a
+	Material Request. Nothing moves until it is issued to a van and accepted."""
+	me = _me()
+	if store not in me.mine or me.places[store]["kind"] != "store":
+		frappe.throw(_("Only the main store books stock to a site."), frappe.PermissionError)
+	place = me.places.get(site)
+	if not place or place["kind"] != "site":
+		frappe.throw(_("Choose the site the stock is for."))
+	if not place.get("project"):
+		frappe.throw(_("{0} is not on an open project.").format(place["label"]))
+	if place["company"] != me.places[store]["company"]:
+		frappe.throw(_("{0} and {1} belong to different companies.").format(me.places[store]["label"], place["label"]))
+
+	rows = _rows(rows)
+	items = _usable([row["item_code"] for row in rows])
+	booking = frappe.new_doc("Material Request")
+	booking.material_request_type = "Material Transfer"
+	booking.company = place["company"]
+	booking.transaction_date = booking.schedule_date = nowdate()
+	booking.set_from_warehouse = store
+	booking.set_warehouse = site
+	for row in rows:
+		uom = items[row["item_code"]].stock_uom
+		booking.append(
+			"items",
+			{
+				"item_code": row["item_code"],
+				"qty": flt(row["qty"]),
+				"uom": uom,
+				"stock_uom": uom,
+				"conversion_factor": 1,
+				"from_warehouse": store,
+				"warehouse": site,
+				"project": place["project"],
+				"schedule_date": nowdate(),
+			},
+		)
+	booking.insert()
+	booking.submit()
+	return {"name": booking.name}
+
+
+@frappe.whitelist()
+def issue(booking, van, docket_id=None):
+	"""Issue what is still to go on a booking to a van, exactly as booked: nothing is
+	captured again. Nothing moves until the driver counts it and accepts."""
+	me = _me()
+	if docket_id:
+		existing = frappe.db.get_value(DOCKET, {"docket_id": docket_id}, "name")
+		if existing:
+			return {"name": existing}
+
+	found = _bookings(me, [booking])
+	if not found:
+		frappe.throw(_("{0} has nothing left to issue, or is not from your store.").format(booking))
+	found = found[0]
+	target = me.places.get(van)
+	if not target or target["kind"] != "van":
+		frappe.throw(_("Choose the van it is going on."))
+	source = me.places[found["from"]]
+	if source["company"] != target["company"]:
+		frappe.throw(_("{0} and {1} belong to different companies.").format(source["label"], target["label"]))
+
+	items = _usable([row["item_code"] for row in found["lines"]])
+	lines = [
+		{
+			"item_code": row["item_code"],
+			"uom": row["uom"],
+			"qty_sent": row["to_go"],
+			"qty": row["to_go"],
+			"s_warehouse": found["from"],
+			"material_request_item": row["row"],
+		}
+		for row in found["lines"]
+	]
+	_check_free(lines, _labels(me.places), items)
+
+	doc = frappe.new_doc(DOCKET)
+	doc.docket_id = docket_id or frappe.generate_hash(length=16)
+	doc.company = source["company"]
+	doc.from_warehouse = found["from"]
+	doc.to_warehouse = van
+	doc.project = found["project"]
+	doc.material_request = booking
+	doc.given_by = me.user
+	doc.given_at = now_datetime()
+	doc.notes = _("For {0}").format(found["site"])
+	for line in lines:
+		line.pop("qty")
+		# No t_warehouse: the driver chooses the part of the van when accepting.
+		doc.append("items", line)
+	doc.insert()
+	return {"name": doc.name}
+
+
 def _open(name):
 	doc = frappe.get_doc(DOCKET, name)
 	if doc.status != "Open":
@@ -779,11 +984,12 @@ def _add_note(doc, note):
 
 
 @frappe.whitelist()
-def accept(name, counted=None, notes=None):
+def accept(name, counted=None, notes=None, put=None):
 	"""Count what arrived and accept it: one Stock Entry for what was counted.
 
 	`counted` maps a docket line to the quantity that arrived; a line not listed
-	arrived in full. What did not arrive stays where it was.
+	arrived in full. What did not arrive stays where it was. Into a van, `put`
+	maps a line to the part of the van the driver put it in; the driver decides.
 	"""
 	me = _me()
 	doc = _open(name)
@@ -806,6 +1012,19 @@ def accept(name, counted=None, notes=None):
 	arrived = [item for item in doc.items if flt(item.qty_received) > 0]
 	if not arrived:
 		frappe.throw(_("Nothing was counted in. If none of it arrived, turn it down instead."))
+
+	target = me.places.get(doc.to_warehouse) or {}
+	if target.get("kind") == "van":
+		compartments = target.get("compartments") or {}
+		chosen = json.loads(put) if isinstance(put, str) and put else (put or {})
+		for item in arrived:
+			category = chosen.get(item.name)
+			if category:
+				if category not in compartments:
+					frappe.throw(_("{0}: {1} has no {2}.").format(item.item_code, target["label"], category))
+				item.t_warehouse = compartments[category]
+			elif item.t_warehouse not in compartments.values():
+				frappe.throw(_("Choose which part of {0} {1} goes into.").format(target["label"], item.item_code))
 
 	labels = _labels(me.places)
 	have = _on_hand(list({item.s_warehouse or doc.from_warehouse for item in arrived}))
@@ -876,6 +1095,117 @@ def withdraw(name):
 	_add_note(doc, _("Withdrawn by {0}").format(me.full_name))
 	doc.save()
 	return {"name": doc.name}
+
+
+# ---- supplier deliveries on site --------------------------------------------
+
+
+def _receiving_sites(me):
+	"""Sites this person books supplier deliveries in at: their own and the ones they manage.
+	Needs the purchase order's site (nest_po_management), which says where it is going."""
+	if not frappe.get_meta("Purchase Order").has_field("po_site"):
+		return []
+	return [
+		name
+		for name, place in me.places.items()
+		if place["kind"] == "site" and (name in me.mine or place.get("site_manager") == me.user)
+	]
+
+
+def _check_receiver(me, site):
+	if site in _receiving_sites(me):
+		return
+	if me.office and me.places.get(site, {}).get("kind") == "site":
+		return
+	frappe.throw(_("Only the site's manager books in deliveries there."), frappe.PermissionError)
+
+
+@frappe.whitelist()
+def deliveries(site):
+	"""Approved purchase orders raised for this site with something still to arrive."""
+	me = _me()
+	_check_receiver(me, site)
+	orders = frappe.get_all(
+		"Purchase Order",
+		filters={
+			"docstatus": 1,
+			"po_site": site,
+			"per_received": ["<", 100],
+			"status": ["not in", ["Closed", "On Hold"]],
+		},
+		fields=["name", "supplier", "supplier_name", "schedule_date"],
+		order_by="schedule_date asc, name asc",
+	)
+	if not orders:
+		return []
+	lines = frappe.get_all(
+		"Purchase Order Item",
+		filters={"parenttype": "Purchase Order", "parent": ["in", [o.name for o in orders]]},
+		fields=["name", "parent", "item_code", "item_name", "uom", "qty", "received_qty", "delivered_by_supplier"],
+		order_by="parent asc, idx asc",
+	)
+	result = []
+	for order in orders:
+		rows = [
+			{
+				"row": line.name,
+				"item_code": line.item_code,
+				"item_name": line.item_name,
+				"uom": line.uom,
+				"pending": flt(line.qty) - flt(line.received_qty),
+			}
+			for line in lines
+			if line.parent == order.name
+			and not line.delivered_by_supplier
+			and flt(line.qty) - flt(line.received_qty) > EPSILON
+		]
+		if rows:
+			result.append(
+				{"name": order.name, "supplier": order.supplier_name or order.supplier, "due": order.schedule_date, "lines": rows}
+			)
+	return result
+
+
+@frappe.whitelist()
+def receive(purchase_order, rows, delivery_note=None):
+	"""Book in what a supplier delivered on site: one Purchase Receipt into the site store
+	for what was counted. Anything short stays open on the order for the next delivery."""
+	from erpnext.buying.doctype.purchase_order.purchase_order import make_purchase_receipt
+
+	me = _me()
+	site = frappe.db.get_value("Purchase Order", purchase_order, "po_site")
+	_check_receiver(me, site)
+
+	if isinstance(rows, str):
+		rows = json.loads(rows)
+	counted = {row.get("po_detail"): flt(row.get("qty")) for row in rows or [] if flt(row.get("qty")) > 0}
+	if not counted:
+		frappe.throw(_("Count at least one line that arrived."))
+
+	receipt = make_purchase_receipt(purchase_order)
+	kept = []
+	for item in receipt.items:
+		qty = counted.pop(item.purchase_order_item, None)
+		if qty is None:
+			continue
+		if qty > flt(item.qty) + EPSILON:
+			frappe.throw(_("Only {0} {1} of {2} is still to come.").format(_qty(item.qty), item.uom, item.item_code))
+		factor = flt(item.conversion_factor) or 1
+		item.qty = item.received_qty = qty
+		item.stock_qty = item.received_stock_qty = qty * factor
+		item.warehouse = site
+		item.idx = len(kept) + 1
+		kept.append(item)
+	if counted:
+		frappe.throw(_("Part of this delivery is not on {0} or has already arrived. Open it again.").format(purchase_order))
+
+	receipt.set("items", kept)
+	receipt.set_warehouse = site
+	receipt.supplier_delivery_note = (delivery_note or "").strip() or None
+	receipt.remarks = _("Received on site at {0} by {1}").format(me.places[site]["label"], me.full_name)
+	receipt.insert()
+	receipt.submit()
+	return {"name": receipt.name}
 
 
 @frappe.whitelist()

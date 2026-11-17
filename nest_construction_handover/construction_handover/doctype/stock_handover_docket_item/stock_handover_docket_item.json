@@ -14,7 +14,8 @@
   "section_route",
   "s_warehouse",
   "column_break_route",
-  "t_warehouse"
+  "t_warehouse",
+  "material_request_item"
  ],
  "fields": [
   {
@@ -84,12 +85,19 @@
    "label": "To Warehouse",
    "options": "Warehouse",
    "read_only": 1
+  },
+  {
+   "fieldname": "material_request_item",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Booking Line",
+   "read_only": 1
   }
  ],
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-10-12 12:00:00.000000",
+ "modified": "2026-11-17 15:00:00.000000",
  "modified_by": "Administrator",
  "module": "Construction Handover",
  "name": "Stock Handover Docket Item",
