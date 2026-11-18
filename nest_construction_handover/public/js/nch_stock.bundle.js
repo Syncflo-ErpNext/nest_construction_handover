@@ -20,9 +20,10 @@ window.nch_stock = {
 		return !uom || uom === 'Nos' ? '' : ' ' + uom;
 	},
 
-	// A quantity with its unit, as one piece of text: 25, 3 Meter.
+	// A quantity with its unit, as one piece of text: 25, 3 Meter. Pages call this
+	// through a plain alias (ch_amount), so it names nch_stock, never `this`.
 	amount: function(value, uom) {
-		return this.qty(value) + this.unit(uom);
+		return window.nch_stock.qty(value) + window.nch_stock.unit(uom);
 	},
 
 	// Which compartment tab a van opens on: the one picked last, else the first with

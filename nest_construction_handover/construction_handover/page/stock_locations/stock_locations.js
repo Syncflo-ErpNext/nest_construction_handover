@@ -35,7 +35,7 @@ var SL_VIEWS = {
 	enquiry: __('Stock Enquiry')
 };
 
-// Shared with the Van & Site Stock page: public/js/nch_stock.js (app_include_js).
+// Shared with the Van & Site Stock page: public/js/nch_stock.bundle.js (app_include_js).
 var SL_COMPARTMENTS = nch_stock.COMPARTMENTS;
 var sl_esc = nch_stock.esc;
 

@@ -40,7 +40,7 @@ frappe.pages['van-site-stock'].on_page_show = function(wrapper) {
 
 var CH_API = 'nest_construction_handover.field.';
 
-// Shared with the Stock Locations page: public/js/nch_stock.js (app_include_js).
+// Shared with the Stock Locations page: public/js/nch_stock.bundle.js (app_include_js).
 var CH_COMPARTMENTS = nch_stock.COMPARTMENTS;
 var ch_esc = nch_stock.esc;
 var ch_qty = nch_stock.qty;
@@ -114,8 +114,9 @@ class ChStock {
 		// the tile is used, not only the first time this page loads. Except over work
 		// half done: coming back to the page must never throw away a list or a count.
 		var sub = (frappe.get_route() || [])[1];
-		if (sub && !this.busy()) this.go(sub);
+		if (sub && !this.busy()) this.go(sub, true);
 		else if (sub && sub !== this.opened) this.say(__('This list is not finished. Send it or clear it, then use the tile again.'));
+		else if (!sub && !this.screen) this.home();
 		else if (this.screen === 'home') this.refresh_inbox();
 	}
 
@@ -127,11 +128,14 @@ class ChStock {
 	// van-site-stock/book, /issue, /send-van, /deliver, /return-store, /return-van, /used,
 	// /receive, /stock, /find, /recent opens that screen (desk tiles link here).
 	open_route() {
-		this.go((frappe.get_route() || [])[1] || 'home');
+		var sub = (frappe.get_route() || [])[1];
+		this.go(sub || 'home', !!sub);
 	}
 
-	go(where) {
+	// from_desk: opened by a desk tile, so its back arrow and Home go back to the desk.
+	go(where, from_desk) {
 		this.opened = where;
+		this.from_desk = !!from_desk;
 		if (where === 'book') this.send('book');
 		else if (where === 'issue') this.issue_list();
 		else if (where === 'send-van') this.send('to-van');
@@ -169,6 +173,23 @@ class ChStock {
 
 	bind_back(handler) {
 		this.$root.find('[data-back]').on('click', handler);
+	}
+
+	// Back arrows and Home: to the desk when a desk tile opened the screen, else to
+	// this page's own home.
+	back_home() {
+		if (this.from_desk) this.leave();
+		else this.home();
+	}
+
+	// Back to the desk. Whatever was half done is dropped, so the next tile opens its
+	// own screen clean instead of "this list is not finished".
+	leave() {
+		this.basket = [];
+		this.counting = false;
+		this.screen = null;
+		this.opened = null;
+		frappe.set_route((frappe.boot.versions || {}).nest_home ? 'nest-home' : '');
 	}
 
 	can_camera() {
@@ -348,6 +369,7 @@ class ChStock {
 	// ---- home --------------------------------------------------------------
 
 	home() {
+		this.from_desk = false;
 		var ctx = this.ctx;
 		var kind = ctx.kind;
 		var here = ctx.mine.length === 1 ? ctx.mine[0].label : __('Your {0} sites', [ctx.mine.length]);
@@ -444,7 +466,7 @@ class ChStock {
 			this.head(__('Issue to a van'), __('Stock booked to sites, waiting to go out'), true),
 			'<div data-issue-list><div class="ch-note">' + __('Loading...') + '</div></div>'
 		].join('\n'), 'issue-list');
-		this.bind_back(() => this.home());
+		this.bind_back(() => this.back_home());
 		ch_call('bookings').then((list) => {
 			if (this.screen !== 'issue-list') return;
 			var $box = this.$root.find('[data-issue-list]');
@@ -504,7 +526,7 @@ class ChStock {
 			ch_call('issue', { booking: b.name, van: van.name, docket_id: this.docket_id }, true).then((r) => {
 				this.done(__('Issued to {0}', [van.label]), r.name + ' · ' + __('nothing moves until the driver counts it and accepts'), [
 					{ label: __('Issue another'), primary: true, fn: () => this.issue_list() },
-					{ label: __('Home'), fn: () => this.home() }
+					{ label: __('Home'), fn: () => this.back_home() }
 				]);
 			});
 		});
@@ -636,7 +658,7 @@ class ChStock {
 			'<div class="ch-actions"><button class="ch-submit" data-record="1">' + ch_icon('paper-plane-tilt') + '<span data-record-label></span></button></div>'
 		].join('\n'), 'send');
 
-		this.bind_back(() => this.home());
+		this.bind_back(() => this.back_home());
 		this.$root.find('[data-side]').on('change', (e) => {
 			var side = $(e.currentTarget).attr('data-side');
 			this[side] = $(e.currentTarget).val();
@@ -815,7 +837,7 @@ class ChStock {
 			}, true).then((r) => {
 				this.done(__('Booked for {0}', [target.label]), r.name + ' · ' + __('it stays in the store until it is issued to a van'), [
 					{ label: __('Book more'), primary: true, fn: () => this.send('book') },
-					{ label: __('Home'), fn: () => this.home() }
+					{ label: __('Home'), fn: () => this.back_home() }
 				]);
 			});
 			return;
@@ -833,7 +855,7 @@ class ChStock {
 			var kind = this.kind;
 			this.done(__('Sent to {0}', [target.label]), r.name + ' · ' + __('nothing moves until they count it and accept'), [
 				{ label: __('Send more'), primary: true, fn: () => this.send(kind) },
-				{ label: __('Home'), fn: () => this.home() }
+				{ label: __('Home'), fn: () => this.back_home() }
 			]);
 		});
 	}
@@ -893,7 +915,7 @@ class ChStock {
 			d.can_accept ? '<div class="ch-actions"><button class="ch-submit" data-accept="1">' + ch_icon('check') + '<span data-accept-label></span></button></div>' : ''
 		].join('\n'), 'review');
 
-		this.bind_back(() => this.home());
+		this.bind_back(() => this.back_home());
 		this.paint_lines(d);
 		this.$root.find('[data-put-all]').on('change', (e) => {
 			this.put = $(e.currentTarget).val() || '';
@@ -972,7 +994,7 @@ class ChStock {
 			notes: this.$root.find('[data-note]').val() || ''
 		}, true).then((r) => {
 			this.done(__('Accepted into {0}', [d.to]), r.stock_entry + ' · ' + d.name, [
-				{ label: __('Home'), primary: true, fn: () => this.home() }
+				{ label: __('Home'), primary: true, fn: () => this.back_home() }
 			]);
 		});
 	}
@@ -986,7 +1008,7 @@ class ChStock {
 				dialog.hide();
 				ch_call('reject', { name: d.name, reason: values.reason }, true).then(() => {
 					this.done(__('Turned down'), d.name + ' · ' + __('nothing moved'), [
-						{ label: __('Home'), primary: true, fn: () => this.home() }
+						{ label: __('Home'), primary: true, fn: () => this.back_home() }
 					]);
 				});
 			}
@@ -998,7 +1020,7 @@ class ChStock {
 		frappe.confirm(__('Withdraw this handover to {0}? Nothing will move.', [d.to]), () => {
 			ch_call('withdraw', { name: d.name }, true).then(() => {
 				this.done(__('Withdrawn'), d.name + ' · ' + __('nothing moved'), [
-					{ label: __('Home'), primary: true, fn: () => this.home() }
+					{ label: __('Home'), primary: true, fn: () => this.back_home() }
 				]);
 			});
 		});
@@ -1020,7 +1042,7 @@ class ChStock {
 			this.scan_box(__('Type to find the site')),
 			'<div class="ch-list" data-sites></div>'
 		].join('\n'), 'pick');
-		this.bind_back(() => this.home());
+		this.bind_back(() => this.back_home());
 
 		var kept = ch_remembered('site');
 		var ordered = sites.slice().sort(function(a, b) { return (b.name === kept) - (a.name === kept); });
@@ -1069,7 +1091,7 @@ class ChStock {
 			'<div class="ch-actions"><button class="ch-submit" data-record="1">' + ch_icon('check') + '<span data-record-label></span></button></div>'
 		].join('\n'), 'use');
 
-		this.bind_back(() => this.home());
+		this.bind_back(() => this.back_home());
 		var filter = '';
 		this.paint_held(site.name, null, () => filter);
 		this.bind_scan((term) => {
@@ -1089,7 +1111,7 @@ class ChStock {
 			}, true).then((r) => {
 				this.done(__('Used on {0}', [site.label]), r.name + ' · ' + __('costed to {0}', [site.project_name || r.project]), [
 					{ label: __('More for {0}', [site.label]), primary: true, fn: () => this.use_at(site) },
-					{ label: __('Home'), fn: () => this.home() }
+					{ label: __('Home'), fn: () => this.back_home() }
 				]);
 			});
 		});
@@ -1124,7 +1146,14 @@ class ChStock {
 
 	// ---- supplier deliveries on site ---------------------------------------
 
+	// The storeman books in orders due at the main store; a site, the orders raised for it.
 	receive() {
+		if (this.ctx.kind === 'store') {
+			var stores = this.ctx.mine;
+			if (stores.length === 1) this.deliveries_at(stores[0]);
+			else this.pick_site(__('Supplier delivery'), stores, (store) => this.deliveries_at(store));
+			return;
+		}
 		var names = this.ctx.receive_at || [];
 		var sites = this.ctx.sites.filter(function(s) { return names.indexOf(s.name) !== -1; });
 		if (sites.length === 1) { this.deliveries_at(sites[0]); return; }
@@ -1142,9 +1171,11 @@ class ChStock {
 					ch_esc(o.supplier),
 					ch_esc([o.name, ch_lines(o.lines.length), o.due ? __('due {0}', [frappe.datetime.str_to_user(o.due)]) : ''].filter(Boolean).join(' · ')),
 					this.tag(__('Count'), 'go')
-				)).join('\n') + '</div>' : '<div class="ch-note">' + __('No approved orders are waiting to arrive at this site.') + '</div>'
+				)).join('\n') + '</div>' : '<div class="ch-note">' + (site.kind === 'store'
+					? __('No approved orders are waiting to arrive at the store.')
+					: __('No approved orders are waiting to arrive at this site.')) + '</div>'
 			].join('\n'), 'deliveries');
-			this.bind_back(() => this.home());
+			this.bind_back(() => this.back_home());
 			this.$root.find('[data-po]').on('click', (e) => {
 				var name = $(e.currentTarget).attr('data-po');
 				this.count_delivery(site, orders.filter(function(o) { return o.name === name; })[0]);
@@ -1176,7 +1207,7 @@ class ChStock {
 			}, true).then((r) => {
 				this.done(__('Booked into {0}', [site.label]), r.name + ' · ' + o.name, [
 					{ label: __('Another delivery'), primary: true, fn: () => this.deliveries_at(site) },
-					{ label: __('Home'), fn: () => this.home() }
+					{ label: __('Home'), fn: () => this.back_home() }
 				]);
 			});
 		});
@@ -1231,7 +1262,7 @@ class ChStock {
 			this.scan_box(__('Type to find an item')),
 			'<div data-stock><div class="ch-note">' + __('Loading...') + '</div></div>'
 		].join('\n'), 'stock');
-		this.bind_back(() => this.home());
+		this.bind_back(() => this.back_home());
 		this.$root.find('[data-side]').on('change', (e) => {
 			ch_remember('stock', $(e.currentTarget).val());
 			this.my_stock($(e.currentTarget).val());
@@ -1291,7 +1322,7 @@ class ChStock {
 			'<div data-results></div>',
 			'<div data-stock></div>'
 		].join('\n'), 'find');
-		this.bind_back(() => this.home());
+		this.bind_back(() => this.back_home());
 		this.bind_scan((term) => this.find_from(term));
 		if (item_code) this.show_stock(item_code);
 	}
@@ -1337,7 +1368,7 @@ class ChStock {
 			this.head(__('Recent'), __('Handovers and what was used on site'), true),
 			'<div data-recent><div class="ch-note">' + __('Loading...') + '</div></div>'
 		].join('\n'), 'recent');
-		this.bind_back(() => this.home());
+		this.bind_back(() => this.back_home());
 		ch_call('recent').then((r) => {
 			var dockets = r.dockets || [];
 			var used = r.used || [];

@@ -16,8 +16,9 @@ after_migrate = "nest_construction_handover.install.after_install"
 app_include_js = [
 	"/assets/nest_construction_handover/js/nch_pwa.js",
 	"/assets/nest_construction_handover/js/nch_mobile.js",
-	# Helpers shared by the Van & Site Stock and Stock Locations pages.
-	"/assets/nest_construction_handover/js/nch_stock.js",
+	# Helpers shared by the Van & Site Stock and Stock Locations pages. A bundle, so
+	# every build gets a new URL: plain /assets files are cached by browsers for a year.
+	"nch_stock.bundle.js",
 ]
 web_include_js = ["/assets/nest_construction_handover/js/nch_pwa.js"]
 boot_session = "nest_construction_handover.mobile.boot_session"

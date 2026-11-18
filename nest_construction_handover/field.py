@@ -1310,10 +1310,61 @@ def _check_receiver(me, site):
 	frappe.throw(_("Only the site's manager books in deliveries there."), frappe.PermissionError)
 
 
+def _check_store(me, store):
+	"""The main store's deliveries are the storeman's (or the office's) to book in."""
+	if me.kind != "store" or store not in me.mine or me.places[store]["kind"] != "store":
+		frappe.throw(_("Only the main store books in deliveries there."), frappe.PermissionError)
+
+
+def _store_deliveries(store):
+	"""Approved purchase orders with lines still to arrive into the main store. An order
+	raised for a site (PO site set) is the site's to book in, so it is left out: the same
+	rule as the Receive Delivery tile's badge (delivery_count)."""
+	not_for_a_site = "and ifnull(po.po_site, '') = ''" if _has_po_site() else ""
+	lines = frappe.db.sql(
+		f"""
+		select po.name as po, po.supplier, po.supplier_name, po.schedule_date,
+			line.name, line.item_code, line.item_name, line.uom, line.qty - line.received_qty as pending
+		from `tabPurchase Order` po
+		inner join `tabPurchase Order Item` line on line.parent = po.name and line.parenttype = 'Purchase Order'
+		where po.docstatus = 1
+			and po.status not in ('Closed', 'On Hold')
+			and po.per_received < 100
+			and line.warehouse = %(store)s
+			and line.qty - line.received_qty > 0.000000001
+			and ifnull(line.delivered_by_supplier, 0) = 0
+			{not_for_a_site}
+		order by po.schedule_date asc, po.name asc, line.idx asc
+		""",
+		{"store": store},
+		as_dict=True,
+	)
+	orders = {}
+	for line in lines:
+		order = orders.setdefault(
+			line.po,
+			{"name": line.po, "supplier": line.supplier_name or line.supplier, "due": line.schedule_date, "lines": []},
+		)
+		order["lines"].append(
+			{
+				"row": line.name,
+				"item_code": line.item_code,
+				"item_name": line.item_name,
+				"uom": line.uom,
+				"pending": flt(line.pending),
+			}
+		)
+	return list(orders.values())
+
+
 @frappe.whitelist()
 def deliveries(site):
-	"""Approved purchase orders raised for this site with something still to arrive."""
+	"""Approved purchase orders with something still to arrive: at the main store for the
+	storeman, or raised for this site for the site."""
 	me = _me()
+	if me.places.get(site, {}).get("kind") == "store":
+		_check_store(me, site)
+		return _store_deliveries(site)
 	_check_receiver(me, site)
 	orders = frappe.get_all(
 		"Purchase Order",
@@ -1358,13 +1409,15 @@ def deliveries(site):
 
 @frappe.whitelist()
 def receive(purchase_order, rows, delivery_note=None):
-	"""Book in what a supplier delivered on site: one Purchase Receipt into the site store
-	for what was counted. Anything short stays open on the order for the next delivery."""
+	"""Book in what a supplier delivered: one Purchase Receipt for what was counted, into
+	the site store for an order raised for a site, else into the main store the order's
+	lines are for. Anything short stays open on the order for the next delivery."""
 	from erpnext.buying.doctype.purchase_order.purchase_order import make_purchase_receipt
 
 	me = _me()
-	site = frappe.db.get_value("Purchase Order", purchase_order, "po_site")
-	_check_receiver(me, site)
+	site = frappe.db.get_value("Purchase Order", purchase_order, "po_site") if _has_po_site() else None
+	if site:
+		_check_receiver(me, site)
 
 	if isinstance(rows, str):
 		rows = json.loads(rows)
@@ -1380,19 +1433,25 @@ def receive(purchase_order, rows, delivery_note=None):
 			continue
 		if qty > flt(item.qty) + EPSILON:
 			frappe.throw(_("Only {0} of {1} is still to come.").format(_amount(item.qty, item.uom), item.item_code))
+		if not site:
+			# Not for a site: only the store the line is for books it in.
+			_check_store(me, item.warehouse)
 		factor = flt(item.conversion_factor) or 1
 		item.qty = item.received_qty = qty
 		item.stock_qty = item.received_stock_qty = qty * factor
-		item.warehouse = site
+		item.warehouse = site or item.warehouse
 		item.idx = len(kept) + 1
 		kept.append(item)
 	if counted:
 		frappe.throw(_("Part of this delivery is not on {0} or has already arrived. Open it again.").format(purchase_order))
 
 	receipt.set("items", kept)
-	receipt.set_warehouse = site
+	into = site or kept[0].warehouse
+	receipt.set_warehouse = into if all(item.warehouse == into for item in kept) else None
 	receipt.supplier_delivery_note = (delivery_note or "").strip() or None
-	receipt.remarks = _("Received on site at {0} by {1}").format(me.places[site]["label"], me.full_name)
+	receipt.remarks = (
+		_("Received on site at {0} by {1}") if site else _("Received at {0} by {1}")
+	).format(me.places[into]["label"], me.full_name)
 	_post(receipt)
 	return {"name": receipt.name}
 
