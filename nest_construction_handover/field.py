@@ -146,10 +146,8 @@ def _whoami():
 
 	mine = [assigned] if assigned in places else []
 	kind = places[assigned]["kind"] if mine else None
+	managed = [name for name, place in places.items() if place["kind"] == "site" and place.get("site_manager") == user]
 	if kind in (None, "site"):
-		managed = [
-			name for name, place in places.items() if place["kind"] == "site" and place.get("site_manager") == user
-		]
 		mine += [name for name in managed if name not in mine]
 		if mine:
 			kind = "site"
@@ -167,6 +165,9 @@ def _whoami():
 		full_name=get_fullname(user),
 		kind=kind,
 		mine=mine,
+		# A driver can also run sites (named Site Manager on the project): his van stays
+		# his own place, and these sites are his too, on the Site Stock tile.
+		managed=[name for name in managed if name not in mine],
 		office=office,
 		roles=roles,
 		places=places,
@@ -182,7 +183,7 @@ def _warehouses_of(place):
 
 def _receives(me, doc):
 	"""Only the place it was sent to accepts it: the office cannot sign for a van."""
-	return doc.to_warehouse in me.mine
+	return doc.to_warehouse in me.mine or doc.to_warehouse in me.managed
 
 
 def _gives(me, doc):
@@ -371,6 +372,7 @@ def bootstrap():
 		"full_name": me.full_name,
 		"kind": me.kind,
 		"mine": [_public(places[name]) for name in me.mine],
+		"managed": [_public(places[name]) for name in me.managed],
 		"stores": listed("store"),
 		"vans": listed("van"),
 		"sites": listed("site"),
@@ -388,12 +390,14 @@ def inbox():
 
 
 def _inbox(me):
+	# The van and the sites a driver runs: the screen shows each on its own tile.
+	places = me.mine + me.managed
 	fields = ["name", "status", "from_warehouse", "to_warehouse", "project", "given_by", "given_at", "stock_entry"]
 	incoming = frappe.get_all(
-		DOCKET, filters={"status": "Open", "to_warehouse": ["in", me.mine]}, fields=fields, order_by="given_at asc"
+		DOCKET, filters={"status": "Open", "to_warehouse": ["in", places]}, fields=fields, order_by="given_at asc"
 	)
 	sent = frappe.get_all(
-		DOCKET, filters={"status": "Open", "from_warehouse": ["in", me.mine]}, fields=fields, order_by="given_at desc"
+		DOCKET, filters={"status": "Open", "from_warehouse": ["in", places]}, fields=fields, order_by="given_at desc"
 	)
 	return {"incoming": _summaries(incoming, me.places), "sent": _summaries(sent, me.places)}
 
@@ -436,6 +440,8 @@ def _summaries(dockets, places):
 				"status": doc.status,
 				"from": labels.get(doc.from_warehouse, doc.from_warehouse),
 				"to": labels.get(doc.to_warehouse, doc.to_warehouse),
+				"from_warehouse": doc.from_warehouse,
+				"to_warehouse": doc.to_warehouse,
 				"project": doc.project,
 				"site": site,
 				"by": get_fullname(doc.given_by),
@@ -946,7 +952,7 @@ def send(from_location, to_location, rows, project=None, notes=None, docket_id=N
 			return {"name": existing}
 
 	places = me.places
-	if from_location not in me.mine:
+	if from_location not in me.mine and from_location not in me.managed:
 		frappe.throw(_("You can only send from your own store, van or site."), frappe.PermissionError)
 	source, target = places[from_location], places.get(to_location)
 	if not target:
@@ -1008,6 +1014,12 @@ def send(from_location, to_location, rows, project=None, notes=None, docket_id=N
 		line.pop("qty")
 		doc.append("items", line)
 	doc.insert()
+
+	# A driver delivering to a site he runs is handing it to himself: it goes straight
+	# into the site store, with nobody else to count it.
+	if source["kind"] == "van" and from_location in me.mine and to_location in me.managed:
+		posted = accept(doc.name)
+		return {"name": doc.name, "stock_entry": posted["stock_entry"], "posted": 1}
 	return {"name": doc.name}
 
 
@@ -1150,6 +1162,19 @@ def inbox_count():
 	if not me or not me.mine:
 		return 0
 	return frappe.db.count(DOCKET, {"status": "Open", "to_warehouse": ["in", me.mine]})
+
+
+@frappe.whitelist()
+def site_inbox_count():
+	"""Handovers waiting at my sites: the Site Stock tile's badge. A site manager's own
+	sites; for a driver who also runs sites, those sites and not his van."""
+	me = _whoami()
+	if not me:
+		return 0
+	sites = me.mine if me.kind == "site" else me.managed
+	if not sites:
+		return 0
+	return frappe.db.count(DOCKET, {"status": "Open", "to_warehouse": ["in", sites]})
 
 
 @frappe.whitelist()

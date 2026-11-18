@@ -65,6 +65,11 @@ function ch_remember(key, value) {
 	nch_stock.keep('van-site-stock', key, value);
 }
 
+// Places in A-Z order of their names, for pickers with many sites.
+function ch_by_label(list) {
+	return (list || []).slice().sort(function(a, b) { return String(a.label).localeCompare(String(b.label)); });
+}
+
 function ch_call(method, args, freeze) {
 	return frappe.call({
 		method: CH_API + method,
@@ -97,7 +102,28 @@ class ChStock {
 	}
 
 	load() {
-		return ch_call('bootstrap').then((ctx) => { this.ctx = ctx; });
+		return ch_call('bootstrap').then((ctx) => {
+			this.all = ctx;
+			this.set_mode(this.site_mode);
+		});
+	}
+
+	// A driver who also runs sites has two screens: his van (the Van Stock tile) and the
+	// sites he runs (the Site Stock tile, van-site-stock/sites). Everyone else has one.
+	can_run_sites() {
+		return this.all.kind === 'van' && (this.all.managed || []).length > 0;
+	}
+
+	set_mode(sites) {
+		var all = this.all;
+		this.site_mode = !!(sites && this.can_run_sites());
+		if (this.site_mode) {
+			this.ctx = $.extend({}, all, { kind: 'site', mine: all.managed });
+		} else {
+			// His van screen stays exactly a van's: supplier deliveries are on his sites' screen.
+			var names = all.mine.map(function(p) { return p.name; });
+			this.ctx = $.extend({}, all, { receive_at: (all.receive_at || []).filter(function(n) { return names.indexOf(n) !== -1; }) });
+		}
 	}
 
 	no_entry() {
@@ -114,6 +140,14 @@ class ChStock {
 		// the tile is used, not only the first time this page loads. Except over work
 		// half done: coming back to the page must never throw away a list or a count.
 		var sub = (frappe.get_route() || [])[1];
+		// van-site-stock/sites is the sites' home, not a screen of its own.
+		var sites = sub === 'sites';
+		if (sites) sub = '';
+		if ((sites && this.can_run_sites()) !== this.site_mode && !this.busy()) {
+			this.set_mode(sites);
+			this.go(sub || 'home', !!sub);
+			return;
+		}
 		if (sub && !this.busy()) this.go(sub, true);
 		else if (sub && sub !== this.opened) this.say(__('This list is not finished. Send it or clear it, then use the tile again.'));
 		else if (!sub && !this.screen) this.home();
@@ -129,6 +163,8 @@ class ChStock {
 	// /receive, /stock, /find, /recent opens that screen (desk tiles link here).
 	open_route() {
 		var sub = (frappe.get_route() || [])[1];
+		this.set_mode(sub === 'sites');
+		if (sub === 'sites') sub = '';
 		this.go(sub || 'home', !!sub);
 	}
 
@@ -540,7 +576,15 @@ class ChStock {
 	}
 
 	paint_inbox() {
-		var inbox = this.ctx.inbox || { incoming: [], sent: [] };
+		var all = this.ctx.inbox || { incoming: [], sent: [] };
+		// Only this screen's places: a driver who runs sites sees his van's handovers on
+		// the van screen and his sites' on the sites screen.
+		var names = this.ctx.mine.map(function(p) { return p.name; });
+		var here = function(warehouse) { return !warehouse || names.indexOf(warehouse) !== -1; };
+		var inbox = {
+			incoming: (all.incoming || []).filter(function(d) { return here(d.to_warehouse); }),
+			sent: (all.sent || []).filter(function(d) { return here(d.from_warehouse); })
+		};
 		var several = this.ctx.mine.length > 1;
 		var $in = this.$root.find('[data-incoming]');
 		var $sent = this.$root.find('[data-sent]');
@@ -620,7 +664,8 @@ class ChStock {
 		this.from = mine_names.indexOf(kept_from) !== -1 ? kept_from : mine_names[0];
 
 		var targets = this.targets(how);
-		var kept_to = ch_remembered(kind + ':to');
+		// Booking: the storeman always chooses the site, never last time's.
+		var kept_to = how.book ? '' : ch_remembered(kind + ':to');
 		this.to = targets.some(function(p) { return p.name === kept_to; }) ? kept_to : (targets.length === 1 ? targets[0].name : '');
 
 		this.paint_send(how);
@@ -673,7 +718,7 @@ class ChStock {
 			this.head(how.title, source ? __('From {0}', [source.label]) : '', true),
 			'<div class="ch-pair">',
 			this.place_field('from', __('From'), ctx.mine, this.from, __('Choose where from')),
-			this.place_field('to', __('To'), this.due ? this.due_first(targets) : targets, this.to, __('Choose where to')),
+			this.place_field('to', __('To'), this.due ? this.due_first(targets) : (how.book ? ch_by_label(targets) : targets), this.to, __('Choose where to')),
 			projects.length ? [
 				'<label class="ch-label">' + __('For a project? (optional)'),
 				'  <select class="ch-select" data-project="1">',
@@ -921,7 +966,10 @@ class ChStock {
 			}))
 		}, true).then((r) => {
 			var kind = this.kind;
-			this.done(__('Sent to {0}', [target.label]), r.name + ' · ' + __('nothing moves until they count it and accept'), [
+			// To a site he runs, a driver's delivery is in at once.
+			var message = r.posted ? __('Booked into {0}', [target.label]) : __('Sent to {0}', [target.label]);
+			var ref = r.posted ? r.stock_entry + ' · ' + r.name : r.name + ' · ' + __('nothing moves until they count it and accept');
+			this.done(message, ref, [
 				{ label: __('Send more'), primary: true, fn: () => this.send(kind) },
 				{ label: __('Home'), fn: () => this.back_home() }
 			]);
@@ -1318,23 +1366,27 @@ class ChStock {
 
 	my_stock(location) {
 		var ctx = this.ctx;
-		var kept = ch_remembered('stock');
-		var names = ctx.mine.map(function(p) { return p.name; });
-		location = location || (names.indexOf(kept) !== -1 ? kept : names[0]);
-		var here = this.place(location);
+		// Several places (a manager's sites): the site is chosen each time, from an A-Z list.
+		var several = ctx.mine.length > 1;
+		if (!several) location = location || ctx.mine[0].name;
+		var here = location ? this.place(location) : null;
 		var title = { store: __('In the store'), van: __('My van'), site: __('On site now') }[ctx.kind];
 
 		this.render([
-			this.head(title, here.label, true),
-			ctx.mine.length > 1 ? '<div class="ch-pair">' + this.place_field('stock', __('Where'), ctx.mine, location, '') + '</div>' : '',
+			this.head(title, here ? here.label : '', true),
+			several ? '<div class="ch-pair">' + this.place_field('stock', __('Where'), ch_by_label(ctx.mine), location || '', __('Choose a site')) + '</div>' : '',
 			this.scan_box(__('Type to find an item')),
-			'<div data-stock><div class="ch-note">' + __('Loading...') + '</div></div>'
+			'<div data-stock><div class="ch-note">' + (location ? __('Loading...') : __('Choose a site to see what is there.')) + '</div></div>'
 		].join('\n'), 'stock');
 		this.bind_back(() => this.back_home());
 		this.$root.find('[data-side]').on('change', (e) => {
-			ch_remember('stock', $(e.currentTarget).val());
-			this.my_stock($(e.currentTarget).val());
+			var picked = $(e.currentTarget).val();
+			if (picked) this.my_stock(picked);
 		});
+		if (!location) {
+			this.bind_scan((term) => this.find_from(term));
+			return;
+		}
 
 		ch_call('held', { location: location }).then((rows) => {
 			rows = rows || [];
