@@ -402,6 +402,13 @@ def _summaries(dockets, places):
 	if not dockets:
 		return []
 	labels = _labels(places)
+	# The site a handover is for: where a delivery goes, else the site of the project an
+	# issue to a van was booked for. A return off a site is not for that site.
+	sites = {name: place for name, place in places.items() if place["kind"] == "site"}
+	site_of_project = {}
+	for place in sites.values():
+		if place.get("project"):
+			site_of_project.setdefault(place["project"], place["label"])
 	lines = {}
 	for row in frappe.get_all(
 		DOCKET_ITEM,
@@ -417,6 +424,12 @@ def _summaries(dockets, places):
 		preview = ", ".join("{0} × {1}".format(r.item_name or r.item_code, _qty(r.qty_sent)) for r in rows[:3])
 		if len(rows) > 3:
 			preview += " " + _("and {0} more").format(len(rows) - 3)
+		if doc.to_warehouse in sites:
+			site = sites[doc.to_warehouse]["label"]
+		elif doc.from_warehouse in sites:
+			site = None
+		else:
+			site = site_of_project.get(doc.project)
 		out.append(
 			{
 				"name": doc.name,
@@ -424,6 +437,7 @@ def _summaries(dockets, places):
 				"from": labels.get(doc.from_warehouse, doc.from_warehouse),
 				"to": labels.get(doc.to_warehouse, doc.to_warehouse),
 				"project": doc.project,
+				"site": site,
 				"by": get_fullname(doc.given_by),
 				"at": doc.given_at,
 				"lines": len(rows),
@@ -488,6 +502,81 @@ def held(location):
 	if not place:
 		frappe.throw(_("{0} is not a store, van or site.").format(location))
 	return _held(_warehouses_of(place), _labels(me.places))
+
+
+@frappe.whitelist()
+def due(van):
+	"""What is on my van for each site and not yet handed over there: site -> lines.
+
+	What the van accepted on handovers for a project, less what has left the van on
+	handovers for that project (an open one carries what was sent, an accepted one
+	what was counted in, so a short count stays due), and never more than is free in
+	that part of the van now. Deliver to a site starts from this list.
+	"""
+	me = _me()
+	place = me.places.get(van)
+	if van not in me.mine or not place or place["kind"] != "van":
+		frappe.throw(_("Only the driver of {0} sees what is due off it.").format(van), frappe.PermissionError)
+	parts = list((place.get("compartments") or {}).values())
+	site_of = {}
+	for name, site in me.places.items():
+		if site["kind"] == "site" and site.get("project"):
+			site_of.setdefault(site["project"], name)
+	if not parts or not site_of:
+		return {}
+
+	values = {"van": van, "parts": tuple(parts)}
+	came = frappe.db.sql(
+		"""
+		select d.project, i.item_code, i.t_warehouse as warehouse, sum(i.qty_received) as qty
+		from `tabStock Handover Docket Item` i
+		inner join `tabStock Handover Docket` d on d.name = i.parent
+		where d.status = 'Posted' and d.to_warehouse = %(van)s and ifnull(d.project, '') != ''
+			and i.t_warehouse in %(parts)s
+		group by d.project, i.item_code, i.t_warehouse
+		order by d.project, i.item_code
+		""",
+		values,
+		as_dict=True,
+	)
+	if not came:
+		return {}
+	gone = {
+		(row.project, row.item_code, row.warehouse): flt(row.qty)
+		for row in frappe.db.sql(
+			"""
+			select d.project, i.item_code, i.s_warehouse as warehouse,
+				sum(case when d.status = 'Posted' then i.qty_received else i.qty_sent end) as qty
+			from `tabStock Handover Docket Item` i
+			inner join `tabStock Handover Docket` d on d.name = i.parent
+			where d.status in ('Open', 'Complete', 'Posted') and d.from_warehouse = %(van)s
+				and ifnull(d.project, '') != '' and i.s_warehouse in %(parts)s
+			group by d.project, i.item_code, i.s_warehouse
+			""",
+			values,
+			as_dict=True,
+		)
+	}
+	held = {(row["item_code"], row["warehouse"]): row for row in _held(parts, _labels(me.places))}
+
+	out = {}
+	for row in came:
+		site = site_of.get(row.project)
+		here = held.get((row.item_code, row.warehouse))
+		if not site or not here or here["tracked"]:
+			continue
+		qty = min(flt(row.qty) - gone.get((row.project, row.item_code, row.warehouse), 0), here["free"])
+		if qty > EPSILON:
+			out.setdefault(site, []).append(
+				{
+					"item_code": row.item_code,
+					"item_name": here["item_name"],
+					"stock_uom": here["stock_uom"],
+					"s_warehouse": row.warehouse,
+					"qty": qty,
+				}
+			)
+	return out
 
 
 # ---- the office's desktop stock views ---------------------------------------
@@ -1051,6 +1140,16 @@ def delivery_count():
 		""",
 		{"stores": tuple(me.mine)},
 	)[0][0]
+
+
+@frappe.whitelist()
+def inbox_count():
+	"""Handovers waiting for me to count and accept: the badge on the driver's and the
+	site manager's tile."""
+	me = _whoami()
+	if not me or not me.mine:
+		return 0
+	return frappe.db.count(DOCKET, {"status": "Open", "to_warehouse": ["in", me.mine]})
 
 
 @frappe.whitelist()

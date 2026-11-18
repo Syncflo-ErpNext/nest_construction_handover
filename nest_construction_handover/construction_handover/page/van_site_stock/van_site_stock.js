@@ -549,10 +549,13 @@ class ChStock {
 			'<div class="ch-waiting">',
 			'  <div class="ch-waiting-head">' + ch_icon('hand-arrow-down') + ch_esc(inbox.incoming.length === 1 ? __('1 handover to accept') : __('{0} handovers to accept', [inbox.incoming.length])) + '</div>',
 			'  <div class="ch-list">',
+			// One row per handover: the site it is for and how many items; tap to see them all.
 			inbox.incoming.map((d) => this.row(
 				'data-docket="' + ch_esc(d.name) + '"',
-				ch_esc(__('From {0}', [d.from])) + (several ? ' <span class="ch-dim">' + ch_esc(__('to {0}', [d.to])) + '</span>' : ''),
-				ch_esc(d.preview) + ' · ' + ch_esc(d.by) + ' · ' + ch_esc(ch_when(d.at)),
+				d.site
+					? ch_esc(__('For {0}', [d.site]))
+					: ch_esc(__('From {0}', [d.from])) + (several ? ' <span class="ch-dim">' + ch_esc(__('to {0}', [d.to])) + '</span>' : ''),
+				ch_esc(ch_lines(d.lines)) + ' · ' + ch_esc(d.site ? __('from {0}', [d.from]) : d.by) + ' · ' + ch_esc(ch_when(d.at)),
 				this.tag(__('Count'), 'go')
 			)).join('\n'),
 			'  </div>',
@@ -608,6 +611,7 @@ class ChStock {
 		var ctx = this.ctx;
 		this.kind = kind;
 		this.basket = [];
+		this.due = null;
 		this.docket_id = frappe.utils.get_random(20);
 		this.project = '';
 
@@ -620,6 +624,37 @@ class ChStock {
 		this.to = targets.some(function(p) { return p.name === kept_to; }) ? kept_to : (targets.length === 1 ? targets[0].name : '');
 
 		this.paint_send(how);
+		if (kind === 'to-site' && (this.place(this.from) || {}).kind === 'van') this.load_due(how);
+	}
+
+	// Deliver to a site starts from what the van holds for each site: a site with stock
+	// due is chosen and its lines are already on the list, in full. The driver checks.
+	load_due(how) {
+		var kind = this.kind;
+		ch_call('due', { van: this.from }).then((due) => {
+			if (this.kind !== kind || this.screen !== 'send') return;
+			this.due = due || {};
+			if (!this.due[this.to]) {
+				var first = this.targets(how).filter((p) => this.due[p.name])[0];
+				if (first) this.to = first.name;
+			}
+			if (!this.basket.length) this.basket = this.due_lines(this.to);
+			this.paint_send(how);
+		});
+	}
+
+	due_lines(site) {
+		return ((this.due || {})[site] || []).map(function(l) { return $.extend({}, l); });
+	}
+
+	// Sites with stock due first, each saying how much.
+	due_first(targets) {
+		var due = this.due;
+		var listed = targets.map(function(p) {
+			var n = (due[p.name] || []).length;
+			return n ? $.extend({}, p, { label: p.label + ' · ' + __('{0} due', [ch_lines(n)]) }) : p;
+		});
+		return listed.filter(function(p) { return due[p.name]; }).concat(listed.filter(function(p) { return !due[p.name]; }));
 	}
 
 	targets(how) {
@@ -638,7 +673,7 @@ class ChStock {
 			this.head(how.title, source ? __('From {0}', [source.label]) : '', true),
 			'<div class="ch-pair">',
 			this.place_field('from', __('From'), ctx.mine, this.from, __('Choose where from')),
-			this.place_field('to', __('To'), targets, this.to, __('Choose where to')),
+			this.place_field('to', __('To'), this.due ? this.due_first(targets) : targets, this.to, __('Choose where to')),
 			projects.length ? [
 				'<label class="ch-label">' + __('For a project? (optional)'),
 				'  <select class="ch-select" data-project="1">',
@@ -667,8 +702,16 @@ class ChStock {
 				// Different shelves: start the list again.
 				this.basket = [];
 				if (!this.targets(how).some((p) => p.name === this.to)) this.to = '';
+				var reload = !!this.due;
+				this.due = null;
 				this.paint_send(how);
+				if (reload) this.load_due(how);
 				return;
+			}
+			if (this.due) {
+				// Another site: its own list.
+				this.basket = this.due_lines(this.to);
+				this.paint_basket();
 			}
 			this.paint_route_note(how);
 		});
@@ -781,8 +824,11 @@ class ChStock {
 			var pick = values && values.take ? values.take : sources[0].value;
 			return (sources.filter(function(s) { return s.value === pick; })[0] || sources[0]).free;
 		};
+		// Out of a van or a site the whole amount is the usual answer. From the main store
+		// nothing earlier says how many, so it starts at one.
+		var from_store = (this.place(this.from) || {}).kind === 'store';
 		this.ask(item, {
-			default: Math.min(1, sources[0].free) || sources[0].free,
+			default: from_store ? (Math.min(1, sources[0].free) || sources[0].free) : sources[0].free,
 			max: free_of,
 			max_text: function(values) { return __('Only {0} free there.', [ch_amount(free_of(values), uom)]); },
 			info: ch_esc(sources.length === 1 ? __('{0} free to send.', [ch_amount(sources[0].free, uom)]) : __('In more than one part of the van.')),
@@ -803,12 +849,14 @@ class ChStock {
 		if (!this.basket.length) {
 			$basket.html('<div class="ch-note">' + __('Nothing added yet. Scan an item, or tap one above.') + '</div>');
 		} else {
+			// On a send screen a line on the list can be tapped to change how many.
+			var changeable = this.screen === 'send';
 			$basket.html(this.basket.map((r, i) => {
 				var where = [];
 				var cat = this.compartment(r.s_warehouse);
 				if (cat) where.push(__('from {0}', [cat]));
 				return [
-					'<div class="ch-row ch-row-static">',
+					'<div class="ch-row ch-row-static"' + (changeable ? ' data-line-qty="' + i + '" style="cursor: pointer"' : '') + '>',
 					'  <span class="ch-row-main">' + ch_esc(r.item_code) + '</span>',
 					'  <span class="ch-row-sub">' + ch_esc([r.item_name].concat(where).filter(Boolean).join(' · ')) + '</span>',
 					'  <span class="ch-row-right">' + ch_esc(ch_amount(r.qty, r.stock_uom)) + '</span>',
@@ -817,13 +865,33 @@ class ChStock {
 				].join('\n');
 			}).join('\n'));
 			$basket.find('[data-remove]').on('click', (e) => {
+				e.stopPropagation();
 				this.basket.splice(+$(e.currentTarget).attr('data-remove'), 1);
 				this.paint_basket();
 			});
+			$basket.find('[data-line-qty]').on('click', (e) => this.change_line(+$(e.currentTarget).attr('data-line-qty')));
 		}
 		var n = this.basket.length;
 		this.$root.find('[data-record]').prop('disabled', !n);
 		this.$root.find('[data-record-label]').text(n ? (this.record_label || '{0}').replace('{0}', ch_lines(n)) : __('Add items first'));
+	}
+
+	// A line on the list: send fewer (part of a delivery), or more up to what is free there.
+	change_line(i) {
+		var r = this.basket[i];
+		if (!r) return;
+		var held = (this.held_rows || []).filter(function(h) { return h.item_code === r.item_code && h.warehouse === r.s_warehouse; });
+		var max = held.length ? this.free_in(r.item_code, r.s_warehouse, held) + flt(r.qty) : null;
+		this.ask(r, {
+			default: r.qty,
+			max: max,
+			max_text: max != null ? __('Only {0} free there.', [ch_amount(max, r.stock_uom)]) : null,
+			info: max != null ? ch_esc(__('{0} free to send.', [ch_amount(max, r.stock_uom)])) : '',
+			action: __('Set')
+		}, (qty) => {
+			r.qty = qty;
+			this.paint_basket();
+		});
 	}
 
 	record_send(how) {
