@@ -368,6 +368,12 @@
 	background: var(--ch-good-tint);
 }
 
+/* Stock in a van or on a site, to pick from: blue, so it never looks like what is going (green). */
+.ch-row-instock {
+	border-color: var(--ch-primary);
+	background: var(--ch-tint);
+}
+
 .ch-row-static {
 	grid-template-columns: minmax(0, 1fr) auto 44px;
 	grid-template-areas: "main right x" "sub right x";

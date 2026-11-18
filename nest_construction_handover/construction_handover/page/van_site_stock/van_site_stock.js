@@ -14,7 +14,7 @@
 frappe.pages['van-site-stock'].on_page_load = function(wrapper) {
 	var page = frappe.ui.make_app_page({ parent: wrapper, title: __('Van & Site Stock'), single_column: true });
 
-	var BUILD_MARKER = 'v0.2.2-2026-11-18-issue-home';
+	var BUILD_MARKER = 'v0.2.3-2026-11-18-instock-colour';
 	console.log('Van & Site Stock loaded:', BUILD_MARKER);
 
 	[
@@ -180,6 +180,7 @@ class ChStock {
 		else if (where === 'return-van') this.send('site-to-van');
 		else if (where === 'used') this.use();
 		else if (where === 'receive') this.receive();
+		else if (where === 'collect') this.collect();
 		else if (where === 'stock') this.my_stock();
 		else if (where === 'find') this.find();
 		else if (where === 'recent') this.recent();
@@ -419,6 +420,7 @@ class ChStock {
 			tiles.push(this.tile('stock', 'package', __('In the store'), __('What is on the shelves')));
 		} else if (kind === 'van') {
 			tiles.push(this.tile('deliver', 'map-pin', __('Deliver to a site'), __('Hand stock over at a site')));
+			tiles.push(this.tile('collect', 'storefront', __('Collect from supplier'), __('Book a site order into your van')));
 			tiles.push(this.tile('used', 'wrench', __('Used on site'), __('Record what was fitted; it costs the job')));
 			tiles.push(this.tile('return-store', 'arrow-u-down-left', __('Back to the store'), __('Return what is not needed')));
 			tiles.push(this.tile('stock', 'package', __('My van'), __('What is in each part of the van')));
@@ -661,7 +663,9 @@ class ChStock {
 
 		var mine_names = ctx.mine.map(function(p) { return p.name; });
 		var kept_from = ch_remembered(kind + ':from');
-		this.from = mine_names.indexOf(kept_from) !== -1 ? kept_from : mine_names[0];
+		// A manager with several sites chooses the site each time: From opens empty.
+		var several = mine_names.length > 1 && this.ctx.kind === 'site';
+		this.from = several ? '' : (mine_names.indexOf(kept_from) !== -1 ? kept_from : mine_names[0]);
 
 		var targets = this.targets(how);
 		// Booking: the storeman always chooses the site, never last time's.
@@ -768,7 +772,7 @@ class ChStock {
 		});
 
 		var filter = '';
-		if (how.out_of_van || source.kind === 'site') this.paint_held(this.from, how, () => filter);
+		if (source && (how.out_of_van || source.kind === 'site')) this.paint_held(this.from, how, () => filter);
 		this.bind_scan((term) => this.send_scan(term, how), (typed) => {
 			filter = typed;
 			this.filter_held(typed);
@@ -811,6 +815,8 @@ class ChStock {
 				}).join('\n'),
 				'</div>'
 			].join('\n'));
+			// In stock in blue; what is going or used is green (paint_basket).
+			$box.find('[data-held-row]').addClass('ch-row-instock');
 			$box.find('[data-held-row]').on('click', (e) => {
 				var r = this.held_rows[+$(e.currentTarget).attr('data-held-row')];
 				if (how) this.add_line(r, { s_warehouse: r.warehouse }, how);
@@ -896,7 +902,7 @@ class ChStock {
 			$basket.html('<div class="ch-note">' + __('Nothing added yet. Scan an item, or tap one above.') + '</div>');
 		} else {
 			// On a send screen a line on the list can be tapped to change how many.
-			var changeable = this.screen === 'send';
+			var changeable = this.screen === 'send' || this.screen === 'use';
 			$basket.html(this.basket.map((r, i) => {
 				var where = [];
 				var cat = this.compartment(r.s_warehouse);
@@ -1205,9 +1211,10 @@ class ChStock {
 			this.head(__('Used on site'), this.site_name(site), true),
 			this.scan_box(__('Scan or type what was fitted')),
 			'<div data-results></div>',
-			'<div data-held></div>',
+			// What was used first, in green; what is on site, to add from, below it.
 			'<div class="ch-section">' + __('Used') + '</div>',
 			'<div class="ch-list" data-basket></div>',
+			'<div data-held></div>',
 			'<label class="ch-label">' + __('Note (optional)') + '<input class="ch-text" data-note="1" autocomplete="off"></label>',
 			'<div class="ch-actions"><button class="ch-submit" data-record="1">' + ch_icon('check') + '<span data-record-label></span></button></div>'
 		].join('\n'), 'use');
@@ -1253,7 +1260,8 @@ class ChStock {
 			return;
 		}
 		this.ask(item, {
-			default: Math.min(1, free) || free,
+			// Empty: the site manager says how many were used.
+			default: '',
 			max: free,
 			max_text: __('Only {0} at this site.', [ch_amount(free, uom)]),
 			info: ch_esc(__('{0} at this site.', [ch_amount(free, uom)]))
@@ -1334,7 +1342,64 @@ class ChStock {
 		});
 	}
 
-	paint_delivery(o) {
+	// ---- collecting a site's order from the supplier -----------------------
+
+	// Any driver picks up an order raised for a site and signs for it into his van. The
+	// site manager then counts it off the van on a handover, like stock from the store.
+	collect() {
+		var van = this.ctx.mine[0];
+		ch_call('collections').then((orders) => {
+			this.render([
+				this.head(__('Collect from supplier'), van.label, true),
+				orders.length ? '<div class="ch-section">' + __('Site orders still at the supplier') + '</div>' : '',
+				orders.length ? '<div class="ch-list">' + orders.map((o) => this.row(
+					'data-po="' + ch_esc(o.name) + '"',
+					ch_esc(o.supplier),
+					ch_esc([__('For {0}', [o.site_label]), o.name, ch_lines(o.lines.length), o.due ? __('due {0}', [frappe.datetime.str_to_user(o.due)]) : ''].filter(Boolean).join(' · ')),
+					this.tag(__('Count'), 'go')
+				)).join('\n') + '</div>' : '<div class="ch-note">' + __('No approved site orders are waiting to be collected.') + '</div>'
+			].join('\n'), 'collections');
+			this.bind_back(() => this.back_home());
+			this.$root.find('[data-po]').on('click', (e) => {
+				var name = $(e.currentTarget).attr('data-po');
+				this.count_collection(van, orders.filter(function(o) { return o.name === name; })[0]);
+			});
+		});
+	}
+
+	count_collection(van, o) {
+		this.counted = {};
+		o.lines.forEach((l) => { this.counted[l.row] = l.pending; });
+		this.render([
+			this.head(o.supplier, __('For {0}', [o.site_label]) + ' · ' + o.name, true),
+			'<div class="ch-section">' + __('Count what you collected (tap a line to change it)') + '</div>',
+			'<div class="ch-list" data-lines></div>',
+			'<label class="ch-label">' + __('Supplier delivery note number (optional)') + '<input class="ch-text" data-dn="1" autocomplete="off"></label>',
+			'<div class="ch-actions"><button class="ch-submit" data-book="1">' + ch_icon('check') + '<span data-book-label></span></button></div>'
+		].join('\n'), 'delivery');
+		this.bind_back(() => this.collect());
+		this.paint_delivery(o, van.label);
+		this.$root.find('[data-book]').on('click', () => {
+			var counted = this.counted;
+			var rows = o.lines.filter(function(l) { return flt(counted[l.row]) > 0; }).map(function(l) {
+				return { po_detail: l.row, qty: counted[l.row] };
+			});
+			ch_call('collect', {
+				purchase_order: o.name,
+				rows: JSON.stringify(rows),
+				delivery_note: this.$root.find('[data-dn]').val() || ''
+			}, true).then((r) => {
+				this.done(__('On {0} for {1}', [van.label, o.site_label]), r.name + ' · ' + o.name, [
+					// Deliver to a site opens on that site, filled with what was collected.
+					{ label: __('Deliver now'), primary: true, fn: () => { ch_remember('to-site:to', r.site); this.send('to-site'); } },
+					{ label: __('Home'), fn: () => this.back_home() }
+				]);
+			});
+		});
+	}
+
+	// into: a driver collecting into his van, not a delivery arriving here.
+	paint_delivery(o, into) {
 		var counted = this.counted;
 		var $lines = this.$root.find('[data-lines]');
 		$lines.html(o.lines.map((l) => {
@@ -1347,7 +1412,7 @@ class ChStock {
 		$lines.find('[data-line]').on('click', (e) => {
 			var l = o.lines.filter(function(x) { return x.row === $(e.currentTarget).attr('data-line'); })[0];
 			this.ask(l, {
-				label: __('How many arrived?'),
+				label: into ? __('How many did you collect?') : __('How many arrived?'),
 				default: counted[l.row],
 				max: l.pending,
 				max_text: __('Only {0} is still to come on this order. The office books in any extra.', [ch_qty(l.pending)]),
@@ -1356,15 +1421,18 @@ class ChStock {
 				action: __('Set')
 			}, (qty) => {
 				counted[l.row] = qty;
-				this.paint_delivery(o);
+				this.paint_delivery(o, into);
 			});
 		});
 		var short = o.lines.filter(function(l) { return flt(counted[l.row]) < flt(l.pending); }).length;
 		var arrived = o.lines.filter(function(l) { return flt(counted[l.row]) > 0; }).length;
+		var short_lines = short === 1 ? __('1 line') : __('{0} lines', [short]);
 		this.$root.find('[data-book]').prop('disabled', !arrived);
 		this.$root.find('[data-book-label]').text(!arrived
 			? __('Nothing counted in')
-			: (short ? __('Book in, {0} short', [short === 1 ? __('1 line') : __('{0} lines', [short])]) : __('Book in {0}', [ch_lines(o.lines.length)])));
+			: into
+				? (short ? __('Book into {0}, {1} short', [into, short_lines]) : __('Book into {0}', [into]))
+				: (short ? __('Book in, {0} short', [short_lines]) : __('Book in {0}', [ch_lines(o.lines.length)])));
 	}
 
 	// ---- what is here ------------------------------------------------------

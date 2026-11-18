@@ -514,7 +514,8 @@ def held(location):
 def due(van):
 	"""What is on my van for each site and not yet handed over there: site -> lines.
 
-	What the van accepted on handovers for a project, less what has left the van on
+	What the van accepted on handovers for a project or collected from a supplier for
+	one, less what has left the van on
 	handovers for that project (an open one carries what was sent, an accepted one
 	what was counted in, so a short count stays due), and never more than is free in
 	that part of the van now. Deliver to a site starts from this list.
@@ -532,7 +533,7 @@ def due(van):
 		return {}
 
 	values = {"van": van, "parts": tuple(parts)}
-	came = frappe.db.sql(
+	handed = frappe.db.sql(
 		"""
 		select d.project, i.item_code, i.t_warehouse as warehouse, sum(i.qty_received) as qty
 		from `tabStock Handover Docket Item` i
@@ -540,11 +541,27 @@ def due(van):
 		where d.status = 'Posted' and d.to_warehouse = %(van)s and ifnull(d.project, '') != ''
 			and i.t_warehouse in %(parts)s
 		group by d.project, i.item_code, i.t_warehouse
-		order by d.project, i.item_code
 		""",
 		values,
 		as_dict=True,
 	)
+	# Collected from a supplier for a site (Collect from supplier): a receipt into the van
+	# against the site's project. A return to the supplier comes off it.
+	collected = frappe.db.sql(
+		"""
+		select i.project, i.item_code, i.warehouse, sum(i.stock_qty) as qty
+		from `tabPurchase Receipt Item` i
+		inner join `tabPurchase Receipt` r on r.name = i.parent
+		where r.docstatus = 1 and ifnull(i.project, '') != '' and i.warehouse in %(parts)s
+		group by i.project, i.item_code, i.warehouse
+		""",
+		values,
+		as_dict=True,
+	)
+	came = {}
+	for row in list(handed) + list(collected):
+		key = (row.project, row.item_code, row.warehouse)
+		came[key] = came.get(key, 0) + flt(row.qty)
 	if not came:
 		return {}
 	gone = {
@@ -566,19 +583,19 @@ def due(van):
 	held = {(row["item_code"], row["warehouse"]): row for row in _held(parts, _labels(me.places))}
 
 	out = {}
-	for row in came:
-		site = site_of.get(row.project)
-		here = held.get((row.item_code, row.warehouse))
+	for (project, item_code, warehouse), qty in sorted(came.items()):
+		site = site_of.get(project)
+		here = held.get((item_code, warehouse))
 		if not site or not here or here["tracked"]:
 			continue
-		qty = min(flt(row.qty) - gone.get((row.project, row.item_code, row.warehouse), 0), here["free"])
+		qty = min(qty - gone.get((project, item_code, warehouse), 0), here["free"])
 		if qty > EPSILON:
 			out.setdefault(site, []).append(
 				{
-					"item_code": row.item_code,
+					"item_code": item_code,
 					"item_name": here["item_name"],
 					"stock_uom": here["stock_uom"],
-					"s_warehouse": row.warehouse,
+					"s_warehouse": warehouse,
 					"qty": qty,
 				}
 			)
@@ -1177,6 +1194,63 @@ def site_inbox_count():
 	return frappe.db.count(DOCKET, {"status": "Open", "to_warehouse": ["in", sites]})
 
 
+# Desk tile counts in two colours: red is waiting on you, orange is your step done and
+# waiting on the other side (issued or sent, not yet accepted). Only counts above 0 show.
+WAITING_COLOUR = "#d92d20"
+PENDING_COLOUR = "#f79009"
+
+
+def _two_counts(waiting, pending):
+	counts = []
+	if waiting:
+		counts.append({"value": waiting, "color": WAITING_COLOUR, "title": _("{0} waiting for you").format(waiting)})
+	if pending:
+		counts.append(
+			{"value": pending, "color": PENDING_COLOUR, "title": _("{0} sent, not yet accepted").format(pending)}
+		)
+	return {"counts": counts}
+
+
+def _open_handovers(field, places):
+	if not places:
+		return 0
+	return frappe.db.count(DOCKET, {"status": "Open", field: ["in", places]})
+
+
+@frappe.whitelist()
+def issue_counts():
+	"""Issue to Van tile: bookings to issue (red), issued but not yet accepted (orange)."""
+	me = _whoami()
+	if not me or me.kind != "store":
+		return _two_counts(0, 0)
+	waiting = len({line.booking for line in _lines_to_go(me)})
+	pending = frappe.db.count(
+		DOCKET, {"status": "Open", "direction": "Store to Van", "from_warehouse": ["in", me.mine]}
+	)
+	return _two_counts(waiting, pending)
+
+
+@frappe.whitelist()
+def van_counts():
+	"""Van Stock tile: handovers to accept into the van (red), sent off it and not yet
+	accepted at the other end (orange)."""
+	me = _whoami()
+	if not me or me.kind != "van":
+		return _two_counts(0, 0)
+	return _two_counts(_open_handovers("to_warehouse", me.mine), _open_handovers("from_warehouse", me.mine))
+
+
+@frappe.whitelist()
+def site_counts():
+	"""Site Stock tile: handovers waiting at my sites (red), sent off them and not yet
+	accepted (orange). A site manager's sites; a driver's own sites, not his van."""
+	me = _whoami()
+	if not me:
+		return _two_counts(0, 0)
+	sites = me.mine if me.kind == "site" else me.managed
+	return _two_counts(_open_handovers("to_warehouse", sites), _open_handovers("from_warehouse", sites))
+
+
 @frappe.whitelist()
 def book(store, site, rows):
 	"""Book stock in the store to a site: the list is captured once and kept as a
@@ -1580,6 +1654,131 @@ def receive(purchase_order, rows, delivery_note=None):
 	return {"name": receipt.name}
 
 
+# ---- a driver collects a site's order from the supplier ----------------------
+#
+# Goods for a site go missing between the supplier and the site unless somebody signs
+# for them at each step. The driver who collects books them into his van's Goods In
+# Transit against the site's project; Deliver to a site then lists them as due there,
+# and the site manager counts them off the van on a handover.
+
+GOODS_IN_TRANSIT = "Goods In Transit"
+
+
+def _my_van(me):
+	if me.kind != "van" or not me.mine:
+		frappe.throw(_("Only a driver collects from a supplier."), frappe.PermissionError)
+	return me.places[me.mine[0]]
+
+
+@frappe.whitelist()
+def collections():
+	"""Approved orders raised for a site with goods still at the supplier: any driver may
+	collect them. By supplier, the way he finds them."""
+	me = _me()
+	van = _my_van(me)
+	if not _has_po_site():
+		return []
+	lines = frappe.db.sql(
+		"""
+		select po.name as po, ifnull(nullif(po.supplier_name, ''), po.supplier) as supplier_label,
+			po.schedule_date, po.po_site,
+			line.name, line.item_code, line.item_name, line.uom, line.qty - line.received_qty as pending
+		from `tabPurchase Order` po
+		inner join `tabPurchase Order Item` line on line.parent = po.name and line.parenttype = 'Purchase Order'
+		where po.docstatus = 1
+			and po.status not in ('Closed', 'On Hold')
+			and po.per_received < 100
+			and ifnull(po.po_site, '') != ''
+			and line.qty - line.received_qty > 0.000000001
+			and ifnull(line.delivered_by_supplier, 0) = 0
+		order by supplier_label asc, po.schedule_date asc, po.name asc, line.idx asc
+		""",
+		as_dict=True,
+	)
+	orders = {}
+	for line in lines:
+		site = me.places.get(line.po_site)
+		if not site or site["kind"] != "site" or not site.get("project") or site["company"] != van["company"]:
+			continue
+		order = orders.setdefault(
+			line.po,
+			{
+				"name": line.po,
+				"supplier": line.supplier_label,
+				"site": site["name"],
+				"site_label": site["label"],
+				"due": line.schedule_date,
+				"lines": [],
+			},
+		)
+		order["lines"].append(
+			{
+				"row": line.name,
+				"item_code": line.item_code,
+				"item_name": line.item_name,
+				"uom": line.uom,
+				"pending": flt(line.pending),
+			}
+		)
+	return list(orders.values())
+
+
+@frappe.whitelist()
+def collect(purchase_order, rows, delivery_note=None):
+	"""Book what the driver collected from the supplier into his van: one Purchase Receipt
+	for what was counted, into Goods In Transit against the site's project. Anything short
+	stays open on the order for the next collection."""
+	from erpnext.buying.doctype.purchase_order.purchase_order import make_purchase_receipt
+
+	me = _me()
+	van = _my_van(me)
+	into = (van.get("compartments") or {}).get(GOODS_IN_TRANSIT)
+	if not into:
+		frappe.throw(_("{0} has no Goods In Transit part. Ask the office to add it.").format(van["label"]))
+	site_name = frappe.db.get_value("Purchase Order", purchase_order, "po_site") if _has_po_site() else None
+	site = me.places.get(site_name) if site_name else None
+	if not site or site["kind"] != "site":
+		frappe.throw(_("{0} is not an order for a site.").format(purchase_order))
+	if not site.get("project"):
+		frappe.throw(_("{0} is not on an open project.").format(site["label"]))
+	if site["company"] != van["company"]:
+		frappe.throw(_("{0} and {1} belong to different companies.").format(van["label"], site["label"]))
+
+	if isinstance(rows, str):
+		rows = json.loads(rows)
+	counted = {row.get("po_detail"): flt(row.get("qty")) for row in rows or [] if flt(row.get("qty")) > 0}
+	if not counted:
+		frappe.throw(_("Count at least one line you collected."))
+
+	receipt = make_purchase_receipt(purchase_order)
+	kept = []
+	for item in receipt.items:
+		qty = counted.pop(item.purchase_order_item, None)
+		if qty is None:
+			continue
+		if qty > flt(item.qty) + EPSILON:
+			frappe.throw(_("Only {0} of {1} is still to collect.").format(_amount(item.qty, item.uom), item.item_code))
+		factor = flt(item.conversion_factor) or 1
+		item.qty = item.received_qty = qty
+		item.stock_qty = item.received_stock_qty = qty * factor
+		item.warehouse = into
+		# The site's job: Deliver to a site lists it as due there.
+		item.project = site["project"]
+		item.idx = len(kept) + 1
+		kept.append(item)
+	if counted:
+		frappe.throw(_("Part of this is not on {0} or has already been collected. Open it again.").format(purchase_order))
+
+	receipt.set("items", kept)
+	receipt.set_warehouse = into
+	receipt.supplier_delivery_note = (delivery_note or "").strip() or None
+	receipt.remarks = _("Collected from {0} by {1} on {2} for {3}").format(
+		receipt.supplier_name or receipt.supplier, me.full_name, van["label"], site["label"]
+	)
+	_post(receipt)
+	return {"name": receipt.name, "site": site["name"]}
+
+
 @frappe.whitelist()
 def use(store, rows, notes=None):
 	"""What was used on site: issued from the site store against its project, which costs it."""
@@ -1608,7 +1807,13 @@ def use(store, rows, notes=None):
 	entry.remarks = "\n".join(
 		filter(None, [_("Used on {0}, recorded by {1}").format(place["label"], me.full_name), (notes or "").strip()])
 	)
+	# Materials used on a job are a cost of the job: the company's Cost of Goods Sold
+	# account, not Stock Adjustment (which is for stock-count differences).
+	expense_account = frappe.get_cached_value("Company", place["company"], "default_expense_account")
 	for line in lines:
-		entry.append("items", dict(line, project=project))
+		row = dict(line, project=project)
+		if expense_account:
+			row["expense_account"] = expense_account
+		entry.append("items", row)
 	_post(entry)
 	return {"name": entry.name, "project": project}
