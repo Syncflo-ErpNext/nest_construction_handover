@@ -131,7 +131,8 @@
    "in_standard_filter": 1,
    "label": "Booking",
    "options": "Material Request",
-   "read_only": 1
+   "read_only": 1,
+   "search_index": 1
   },
   {
    "fieldname": "sb_items",
@@ -226,7 +227,7 @@
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-11-17 15:00:00.000000",
+ "modified": "2026-11-18 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Construction Handover",
  "name": "Stock Handover Docket",

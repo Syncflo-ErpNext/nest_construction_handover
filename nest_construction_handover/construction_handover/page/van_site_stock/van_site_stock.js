@@ -40,24 +40,12 @@ frappe.pages['van-site-stock'].on_page_show = function(wrapper) {
 
 var CH_API = 'nest_construction_handover.field.';
 
-// The order a van's compartments are shown in, and taken from when stock leaves the van:
-// project stock first, then wherever the item is.
-var CH_COMPARTMENTS = ['Goods In Transit', 'Van Stock', 'Technician Tools', 'Assets'];
-
-function ch_esc(s) {
-	var map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-	return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) { return map[c]; });
-}
-
-// Quantities as people say them: 25, not 25.000.
-function ch_qty(value) {
-	return String(parseFloat(flt(value).toFixed(4)));
-}
-
-// A unit worth saying after a quantity: " Meter", but nothing for plain Nos.
-function ch_unit(uom) {
-	return !uom || uom === 'Nos' ? '' : ' ' + uom;
-}
+// Shared with the Stock Locations page: public/js/nch_stock.js (app_include_js).
+var CH_COMPARTMENTS = nch_stock.COMPARTMENTS;
+var ch_esc = nch_stock.esc;
+var ch_qty = nch_stock.qty;
+var ch_amount = nch_stock.amount;
+var ch_lines = nch_stock.lines;
 
 function ch_icon(name) {
 	return '<i class="ph ph-' + name + '" aria-hidden="true"></i>';
@@ -68,18 +56,13 @@ function ch_when(value) {
 	return frappe.datetime.prettyDate ? frappe.datetime.prettyDate(value) : frappe.datetime.str_to_user(value);
 }
 
-function ch_lines(n) {
-	return n === 1 ? __('1 item') : __('{0} items', [n]);
-}
-
-// The places someone picked last, per screen, so the second handover of a shift is three
-// taps. A locked-down browser is not a reason to stop working.
+// The places someone picked last, per screen, so the second handover of a shift is three taps.
 function ch_remembered(key) {
-	try { return localStorage.getItem('van-site-stock:' + key) || ''; } catch (e) { return ''; }
+	return nch_stock.kept('van-site-stock', key);
 }
 
 function ch_remember(key, value) {
-	try { localStorage.setItem('van-site-stock:' + key, value || ''); } catch (e) { /* storage blocked */ }
+	nch_stock.keep('van-site-stock', key, value);
 }
 
 function ch_call(method, args, freeze) {
@@ -128,10 +111,17 @@ class ChStock {
 	on_show() {
 		if (!this.ctx) return;
 		// A desk tile names its screen (van-site-stock/book, /issue): open it every time
-		// the tile is used, not only the first time this page loads.
+		// the tile is used, not only the first time this page loads. Except over work
+		// half done: coming back to the page must never throw away a list or a count.
 		var sub = (frappe.get_route() || [])[1];
-		if (sub) this.go(sub);
+		if (sub && !this.busy()) this.go(sub);
+		else if (sub && sub !== this.opened) this.say(__('This list is not finished. Send it or clear it, then use the tile again.'));
 		else if (this.screen === 'home') this.refresh_inbox();
+	}
+
+	busy() {
+		if (this.screen === 'send' || this.screen === 'use') return this.basket.length > 0;
+		return (this.screen === 'review' && this.counting) || this.screen === 'delivery';
 	}
 
 	// van-site-stock/book, /issue, /send-van, /deliver, /return-store, /return-van, /used,
@@ -141,6 +131,7 @@ class ChStock {
 	}
 
 	go(where) {
+		this.opened = where;
 		if (where === 'book') this.send('book');
 		else if (where === 'issue') this.issue_list();
 		else if (where === 'send-van') this.send('to-van');
@@ -232,6 +223,11 @@ class ChStock {
 		frappe.show_alert({ message: ch_esc(message), indicator: tone || 'orange' }, 5);
 	}
 
+	// The label/value lines of a card; empty entries (null) are left out.
+	facts(list) {
+		return list.filter(Boolean).map(function(f) { return '<div class="ch-fact"><span>' + ch_esc(f[0]) + '</span><b>' + ch_esc(f[1]) + '</b></div>'; }).join('\n');
+	}
+
 	tile(go, icon, title, blurb) {
 		return [
 			'<button class="ch-tile" data-go="' + go + '">',
@@ -277,9 +273,9 @@ class ChStock {
 		return '<label class="ch-label">' + ch_esc(label) + body + '</label>';
 	}
 
-	// How many, and from or into where: one dialog. opts: default, max (number or
-	// function of the dialog values), max_text, info, label, action, allow_zero,
-	// take / put ([{value, label}]) with take_default / put_default.
+	// How many, and from where: one dialog. opts: default, max (number or function of
+	// the dialog values), max_text, info, label, action, allow_zero, take
+	// ([{value, label}]) with take_default.
 	ask(item, opts, done) {
 		var me = this;
 		opts = opts || {};
@@ -288,7 +284,6 @@ class ChStock {
 			{ fieldtype: 'Float', fieldname: 'qty', label: opts.label || __('How many?'), reqd: 1, default: opts.default != null ? opts.default : 1 }
 		];
 		if (opts.take) fields.push({ fieldtype: 'Select', fieldname: 'take', label: __('Take from'), reqd: 1, options: opts.take, default: opts.take_default });
-		if (opts.put) fields.push({ fieldtype: 'Select', fieldname: 'put', label: __('Put in'), reqd: 1, options: opts.put, default: opts.put_default });
 		var d = new frappe.ui.Dialog({
 			title: item.item_code,
 			fields: fields,
@@ -469,7 +464,6 @@ class ChStock {
 	// Issue a booking to a van exactly as booked: pick the van, tap Issue.
 	// back: where the back arrow goes, the screen the booking was picked from.
 	issue_booking(b, back) {
-		back = back || (() => this.home());
 		var vans = this.ctx.vans;
 		var kept = ch_remembered('issue:van');
 		this.to = vans.some(function(v) { return v.name === kept; }) ? kept : (vans.length === 1 ? vans[0].name : '');
@@ -477,8 +471,7 @@ class ChStock {
 		this.render([
 			this.head(__('For {0}', [b.site]), b.name, true),
 			'<div class="ch-card">',
-			[[__('Site'), b.site], b.project ? [__('Project'), b.project_name || b.project] : null, [__('Booked by'), b.by + ' · ' + ch_when(b.at)]]
-				.filter(Boolean).map(function(f) { return '<div class="ch-fact"><span>' + ch_esc(f[0]) + '</span><b>' + ch_esc(f[1]) + '</b></div>'; }).join('\n'),
+			this.facts([[__('Site'), b.site], b.project ? [__('Project'), b.project_name || b.project] : null, [__('Booked by'), b.by + ' · ' + ch_when(b.at)]]),
 			'</div>',
 			'<div class="ch-section">' + __('Going') + '</div>',
 			'<div class="ch-list">',
@@ -486,7 +479,7 @@ class ChStock {
 				'<div class="ch-row ch-row-static">',
 				'  <span class="ch-row-main">' + ch_esc(l.item_code) + '</span>',
 				'  <span class="ch-row-sub">' + ch_esc(l.item_name || '') + '</span>',
-				'  <span class="ch-row-right">' + ch_qty(l.to_go) + ch_esc(ch_unit(l.uom)) + (l.to_go < l.booked ? '<br><span class="ch-dim">' + ch_esc(__('of {0} booked', [ch_qty(l.booked)])) + '</span>' : '') + '</span>',
+				'  <span class="ch-row-right">' + ch_esc(ch_amount(l.to_go, l.uom)) + (l.to_go < l.booked ? '<br><span class="ch-dim">' + ch_esc(__('of {0} booked', [ch_qty(l.booked)])) + '</span>' : '') + '</span>',
 				'</div>'
 			].join('\n')).join('\n'),
 			'</div>',
@@ -702,7 +695,7 @@ class ChStock {
 				this.held_rows.map((r, i) => {
 					// The compartment first: on a phone the end of the line is cut off.
 					var sub = (in_van ? ch_esc(this.compartment(r.warehouse)) + ' · ' : '') + ch_esc(r.item_name);
-					var right = ch_qty(r.free) + ch_esc(ch_unit(r.stock_uom)) + (r.free < r.qty ? '<br><span class="ch-dim">' + __('{0} on its way', [ch_qty(r.qty - r.free)]) + '</span>' : '');
+					var right = ch_esc(ch_amount(r.free, r.stock_uom)) + (r.free < r.qty ? '<br><span class="ch-dim">' + __('{0} on its way', [ch_qty(r.qty - r.free)]) + '</span>' : '');
 					return this.row('data-held-row="' + i + '" data-filter="' + ch_esc((r.item_code + ' ' + r.item_name).toLowerCase()) + '"', ch_esc(r.item_code), sub, right);
 				}).join('\n'),
 				'</div>'
@@ -746,7 +739,6 @@ class ChStock {
 		}
 		var held = item.held || (this.held_rows || []).filter(function(r) { return r.item_code === item.item_code; });
 		var uom = item.stock_uom || '';
-		var unit = ch_unit(uom);
 
 		// Leaving a van: which compartment. Anywhere else: the place itself.
 		var sources = how.out_of_van
@@ -761,32 +753,26 @@ class ChStock {
 			return;
 		}
 
-		var ask = (category) => {
-			var free_of = function(values) {
-				var pick = values && values.take ? values.take : sources[0].value;
-				return (sources.filter(function(s) { return s.value === pick; })[0] || sources[0]).free;
-			};
-			this.ask(item, {
-				default: Math.min(1, sources[0].free) || sources[0].free,
-				max: free_of,
-				max_text: function(values) { return __('Only {0}{1} free there.', [ch_qty(free_of(values)), unit]); },
-				info: ch_esc(sources.length === 1 ? __('{0}{1} free to send.', [ch_qty(sources[0].free), unit]) : __('In more than one part of the van.')),
-				take: sources.length > 1 ? sources.map(function(s) { return { value: s.value, label: s.cat + ' · ' + ch_qty(s.free) + unit }; }) : null,
-				take_default: sources[0].value,
-				put: category ? this.ctx.pickable.map(function(c) { return { value: c, label: c }; }) : null,
-				put_default: category
-			}, (qty, values) => {
-				var s_warehouse = values.take || sources[0].value;
-				var t_category = values.put || '';
-				var already = this.basket.filter(function(b) { return b.item_code === item.item_code && b.s_warehouse === s_warehouse && b.t_category === t_category; })[0];
-				if (already) already.qty += qty;
-				else this.basket.push({ item_code: item.item_code, item_name: item.item_name, stock_uom: uom, qty: qty, s_warehouse: s_warehouse, t_category: t_category });
-				this.paint_basket();
-			});
+		// Into a van the driver chooses the compartment when accepting, so the sender
+		// only says how many, and from which compartment when leaving a van.
+		var free_of = function(values) {
+			var pick = values && values.take ? values.take : sources[0].value;
+			return (sources.filter(function(s) { return s.value === pick; })[0] || sources[0]).free;
 		};
-
-		// Into a van the driver chooses the compartment when accepting, so nothing to pick here.
-		ask(null);
+		this.ask(item, {
+			default: Math.min(1, sources[0].free) || sources[0].free,
+			max: free_of,
+			max_text: function(values) { return __('Only {0} free there.', [ch_amount(free_of(values), uom)]); },
+			info: ch_esc(sources.length === 1 ? __('{0} free to send.', [ch_amount(sources[0].free, uom)]) : __('In more than one part of the van.')),
+			take: sources.length > 1 ? sources.map(function(s) { return { value: s.value, label: s.cat + ' · ' + ch_amount(s.free, uom) }; }) : null,
+			take_default: sources[0].value
+		}, (qty, values) => {
+			var s_warehouse = values.take || sources[0].value;
+			var already = this.basket.filter(function(b) { return b.item_code === item.item_code && b.s_warehouse === s_warehouse; })[0];
+			if (already) already.qty += qty;
+			else this.basket.push({ item_code: item.item_code, item_name: item.item_name, stock_uom: uom, qty: qty, s_warehouse: s_warehouse });
+			this.paint_basket();
+		});
 	}
 
 	paint_basket(label) {
@@ -803,7 +789,7 @@ class ChStock {
 					'<div class="ch-row ch-row-static">',
 					'  <span class="ch-row-main">' + ch_esc(r.item_code) + '</span>',
 					'  <span class="ch-row-sub">' + ch_esc([r.item_name].concat(where).filter(Boolean).join(' · ')) + '</span>',
-					'  <span class="ch-row-right">' + ch_qty(r.qty) + ch_esc(ch_unit(r.stock_uom)) + '</span>',
+					'  <span class="ch-row-right">' + ch_esc(ch_amount(r.qty, r.stock_uom)) + '</span>',
 					'  <button class="ch-remove" data-remove="' + i + '" aria-label="' + __('Remove') + '">' + ch_icon('x') + '</button>',
 					'</div>'
 				].join('\n');
@@ -841,7 +827,7 @@ class ChStock {
 			notes: this.$root.find('[data-note]').val() || '',
 			docket_id: this.docket_id,
 			rows: JSON.stringify(this.basket.map(function(r) {
-				return { item_code: r.item_code, qty: r.qty, s_warehouse: r.s_warehouse, t_category: r.t_category };
+				return { item_code: r.item_code, qty: r.qty, s_warehouse: r.s_warehouse };
 			}))
 		}, true).then((r) => {
 			var kind = this.kind;
@@ -859,6 +845,8 @@ class ChStock {
 			this.counted = {};
 			// Into a van, the one part of the van the whole handover goes in.
 			this.put = '';
+			// Counting a handover is work in progress (see busy()); looking at one is not.
+			this.counting = !!d.can_accept;
 			d.lines.forEach((l) => { this.counted[l.row] = l.sent; });
 			this.paint_review(d);
 		});
@@ -878,7 +866,7 @@ class ChStock {
 			[__('Sent by'), d.by + ' · ' + ch_when(d.at)],
 			d.received_by ? [__('Accepted by'), d.received_by + ' · ' + ch_when(d.received_at)] : null,
 			d.stock_entry ? [__('Stock entry'), d.stock_entry] : null
-		].filter(Boolean);
+		];
 		var status = d.status === 'Open' ? null : (d.status === 'Posted' ? this.tag(__('Accepted'), 'good') : this.tag(__('Cancelled'), 'warn'));
 		var title = d.can_accept ? __('From {0}', [d.from]) : __('To {0}', [d.to]);
 
@@ -886,7 +874,7 @@ class ChStock {
 			this.head(title, d.name, true),
 			'<div class="ch-card">',
 			status ? '<div class="ch-card-status">' + status + '</div>' : '',
-			facts.map(function(f) { return '<div class="ch-fact"><span>' + ch_esc(f[0]) + '</span><b>' + ch_esc(f[1]) + '</b></div>'; }).join('\n'),
+			this.facts(facts),
 			d.notes ? '<div class="ch-notes">' + ch_esc(d.notes).replace(/\n/g, '<br>') + '</div>' : '',
 			'</div>',
 			d.can_accept && d.into_van ? [
@@ -930,12 +918,12 @@ class ChStock {
 			if (d.can_accept) {
 				var n = flt(counted[l.row]);
 				right = n === flt(l.sent)
-					? this.tag(__('All {0}', [ch_qty(l.sent) + ch_unit(l.uom)]), 'good')
+					? this.tag(__('All {0}', [ch_amount(l.sent, l.uom)]), 'good')
 					: this.tag(__('{0} of {1}', [ch_qty(n), ch_qty(l.sent)]), 'warn');
 			} else if (d.status === 'Posted') {
-				right = flt(l.received) === flt(l.sent) ? ch_qty(l.sent) + ch_esc(ch_unit(l.uom)) : this.tag(__('{0} of {1}', [ch_qty(l.received), ch_qty(l.sent)]), 'warn');
+				right = flt(l.received) === flt(l.sent) ? ch_esc(ch_amount(l.sent, l.uom)) : this.tag(__('{0} of {1}', [ch_qty(l.received), ch_qty(l.sent)]), 'warn');
 			} else {
-				right = ch_qty(l.sent) + ch_esc(ch_unit(l.uom));
+				right = ch_esc(ch_amount(l.sent, l.uom));
 			}
 			return this.row((d.can_accept ? '' : 'disabled ') + 'data-line="' + ch_esc(l.row) + '"', ch_esc(l.item_code), sub, right);
 		}).join('\n'));
@@ -947,7 +935,7 @@ class ChStock {
 					default: counted[l.row],
 					max: l.sent,
 					max_text: __('Only {0} was sent. Ask for the extra to be sent on its own.', [ch_qty(l.sent)]),
-					info: ch_esc(__('{0}{1} sent.', [ch_qty(l.sent), ch_unit(l.uom)])),
+					info: ch_esc(__('{0} sent.', [ch_amount(l.sent, l.uom)])),
 					allow_zero: true,
 					action: __('Set')
 				}, (qty) => {
@@ -980,7 +968,7 @@ class ChStock {
 		ch_call('accept', {
 			name: d.name,
 			counted: JSON.stringify(this.counted),
-			put: d.into_van ? (this.put || '') : '',
+			put: this.put,
 			notes: this.$root.find('[data-note]').val() || ''
 		}, true).then((r) => {
 			this.done(__('Accepted into {0}', [d.to]), r.stock_entry + ' · ' + d.name, [
@@ -1124,8 +1112,8 @@ class ChStock {
 		this.ask(item, {
 			default: Math.min(1, free) || free,
 			max: free,
-			max_text: __('Only {0}{1} at this site.', [ch_qty(free), ch_unit(uom)]),
-			info: ch_esc(__('{0}{1} at this site.', [ch_qty(free), ch_unit(uom)]))
+			max_text: __('Only {0} at this site.', [ch_amount(free, uom)]),
+			info: ch_esc(__('{0} at this site.', [ch_amount(free, uom)]))
 		}, (qty) => {
 			var already = this.basket.filter(function(b) { return b.item_code === item.item_code; })[0];
 			if (already) already.qty += qty;
@@ -1200,7 +1188,7 @@ class ChStock {
 		$lines.html(o.lines.map((l) => {
 			var n = flt(counted[l.row]);
 			var right = n === flt(l.pending)
-				? this.tag(__('All {0}', [ch_qty(l.pending) + ch_unit(l.uom)]), 'good')
+				? this.tag(__('All {0}', [ch_amount(l.pending, l.uom)]), 'good')
 				: this.tag(__('{0} of {1}', [ch_qty(n), ch_qty(l.pending)]), 'warn');
 			return this.row('data-line="' + ch_esc(l.row) + '"', ch_esc(l.item_code), ch_esc(l.item_name || ''), right);
 		}).join('\n'));
@@ -1211,7 +1199,7 @@ class ChStock {
 				default: counted[l.row],
 				max: l.pending,
 				max_text: __('Only {0} is still to come on this order. The office books in any extra.', [ch_qty(l.pending)]),
-				info: ch_esc(__('{0}{1} still to come.', [ch_qty(l.pending), ch_unit(l.uom)])),
+				info: ch_esc(__('{0} still to come.', [ch_amount(l.pending, l.uom)])),
 				allow_zero: true,
 				action: __('Set')
 			}, (qty) => {
@@ -1254,19 +1242,18 @@ class ChStock {
 			var $box = this.$root.find('[data-stock]');
 			if (!rows.length) { $box.html('<div class="ch-note">' + __('Nothing here at the moment.') + '</div>'); return; }
 			var line = (r) => {
-				var right = ch_qty(r.qty) + ch_esc(ch_unit(r.stock_uom)) + (r.free < r.qty ? '<br><span class="ch-dim">' + __('{0} on its way out', [ch_qty(r.qty - r.free)]) + '</span>' : '');
+				var right = ch_esc(ch_amount(r.qty, r.stock_uom)) + (r.free < r.qty ? '<br><span class="ch-dim">' + __('{0} on its way out', [ch_qty(r.qty - r.free)]) + '</span>' : '');
 				return this.row('disabled data-filter="' + ch_esc((r.item_code + ' ' + r.item_name).toLowerCase()) + '" data-held-row="1"', ch_esc(r.item_code), ch_esc(r.item_name), right);
 			};
 			if (here.kind === 'van') {
 				// One tab per part of the van, and one tight line per item: a van holds a lot.
 				var parts = CH_COMPARTMENTS.filter(function(cat) { return (here.compartments || {})[cat]; });
 				var in_part = function(cat) { return rows.filter(function(r) { return r.warehouse === here.compartments[cat]; }); };
-				var kept_tab = ch_remembered('van-tab');
-				var tab = parts.indexOf(kept_tab) !== -1 ? kept_tab : (parts.filter(function(cat) { return in_part(cat).length; })[0] || parts[0]);
+				var tab = nch_stock.first_tab(parts, ch_remembered('van-tab'), function(cat) { return in_part(cat).length; });
 				var compact = function(r) {
 					var out = r.free < r.qty ? '<small>' + ch_esc(__('{0} on its way out', [ch_qty(r.qty - r.free)])) + '</small>' : '';
 					return '<div class="ch-compact-row" data-held-row="1" data-filter="' + ch_esc((r.item_code + ' ' + r.item_name).toLowerCase()) + '">' +
-						'<span>' + ch_esc(r.item_name || r.item_code) + '</span><b>' + ch_qty(r.qty) + ch_esc(ch_unit(r.stock_uom)) + out + '</b></div>';
+						'<span>' + ch_esc(r.item_name || r.item_code) + '</span><b>' + ch_esc(ch_amount(r.qty, r.stock_uom)) + out + '</b></div>';
 				};
 				var paint_tab = () => {
 					var mine = in_part(tab);
@@ -1331,13 +1318,13 @@ class ChStock {
 				'  <div class="ch-card-title">' + ch_esc(s.item_name || s.item_code) + '</div>',
 				'  <div class="ch-dim">' + ch_esc(s.item_code) + '</div>',
 				'  <div class="ch-totals">',
-				'    <div><b>' + ch_qty(s.on_hand) + '</b><span>' + ch_esc((ch_unit(uom) + ' ' + __('on hand')).trim()) + '</span></div>',
-				'    <div><b>' + ch_qty(s.on_order) + '</b><span>' + ch_esc((ch_unit(uom) + ' ' + __('on order')).trim()) + '</span></div>',
+				'    <div><b>' + ch_esc(ch_amount(s.on_hand, uom)) + '</b><span>' + __('on hand') + '</span></div>',
+				'    <div><b>' + ch_esc(ch_amount(s.on_order, uom)) + '</b><span>' + __('on order') + '</span></div>',
 				'  </div>',
 				'</div>',
 				rows.length ? '<div class="ch-section">' + __('Where it is') + '</div><div class="ch-list">' + rows.map((r) => {
 					var main = ch_esc(r.where) + (r.mine ? ' ' + this.tag(__('Yours')) : '');
-					return this.row('disabled', main, '', ch_qty(r.qty) + ch_esc(ch_unit(uom)));
+					return this.row('disabled', main, '', ch_esc(ch_amount(r.qty, uom)));
 				}).join('\n') + '</div>' : '<div class="ch-note">' + __('None in stock anywhere.') + '</div>'
 			].join('\n'));
 		});

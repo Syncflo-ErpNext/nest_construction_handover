@@ -10,7 +10,7 @@ frappe.pages['stock-locations'].on_page_load = function(wrapper) {
 	var page = frappe.ui.make_app_page({ parent: wrapper, title: __('Stock'), single_column: true });
 
 	// Bump with every stylesheet change so browsers fetch the new one.
-	var BUILD_MARKER = 'v0.2.2-2026-11-18-van-tabs';
+	var BUILD_MARKER = 'v0.2.3-2026-11-18-review-fixes';
 	if (!document.getElementById('sl-stylesheet')) {
 		var link = document.createElement('link');
 		link.id = 'sl-stylesheet';
@@ -35,46 +35,36 @@ var SL_VIEWS = {
 	enquiry: __('Stock Enquiry')
 };
 
-// The order a van's compartments are shown in, as on the phone screen.
-var SL_COMPARTMENTS = ['Goods In Transit', 'Van Stock', 'Technician Tools', 'Assets'];
-
-function sl_esc(value) {
-	return frappe.utils.escape_html(value == null ? '' : String(value));
-}
-
-// 25, not 25.000; and no unit after plain Nos.
-function sl_qty(qty, uom) {
-	return String(parseFloat(flt(qty).toFixed(4))) + (!uom || uom === 'Nos' ? '' : ' ' + uom);
-}
+// Shared with the Van & Site Stock page: public/js/nch_stock.js (app_include_js).
+var SL_COMPARTMENTS = nch_stock.COMPARTMENTS;
+var sl_esc = nch_stock.esc;
 
 function sl_kept(key) {
-	try { return localStorage.getItem('stock-locations:' + key) || ''; } catch (e) { return ''; }
+	return nch_stock.kept('stock-locations', key);
 }
 
 function sl_keep(key, value) {
-	try { localStorage.setItem('stock-locations:' + key, value || ''); } catch (e) { /* storage blocked */ }
+	nch_stock.keep('stock-locations', key, value);
 }
 
 class StockLocations {
 
+	// Nothing loads here: the desk shows the page straight after loading it, and
+	// every show (the first one included) goes through open().
 	constructor(page) {
 		this.page = page;
 		this.$root = $('<div class="sl-root"></div>').appendTo(page.main);
-		page.set_secondary_action(__('Refresh'), () => this.open(true), 'refresh');
-		this.open();
+		page.set_secondary_action(__('Refresh'), () => this.open(), 'refresh');
 	}
 
-	// Open the view the route names. Coming back to the page refreshes it; the
-	// show that follows the first load straight away does not load it twice.
-	open(force) {
+	// Open the view the route names, with fresh figures every time.
+	open() {
 		var route = frappe.get_route() || [];
 		var view = SL_VIEWS[route[1]] ? route[1] : 'main';
 		// Every show: the desk puts the page's own title back when it is shown.
 		this.page.set_title(SL_VIEWS[view]);
 		var fresh = view !== this.view;
-		if (!fresh && !force && Date.now() - (this.opened_at || 0) < 2000) return;
 		this.view = view;
-		this.opened_at = Date.now();
 
 		if (view === 'enquiry') {
 			if (fresh) this.paint_enquiry();
@@ -166,22 +156,22 @@ class StockLocations {
 			var parts = SL_COMPARTMENTS.filter(function(cat) { return place.compartments.indexOf(cat) !== -1; });
 			var in_part = function(cat) { return place.rows.filter(function(r) { return r.category === cat; }); };
 			if (this.tab === undefined) this.tab = sl_kept('van-tab') || null;
-			var tab = parts.indexOf(this.tab) !== -1 ? this.tab : (parts.filter(function(cat) { return in_part(cat).length; })[0] || parts[0]);
+			var tab = nch_stock.first_tab(parts, this.tab, function(cat) { return in_part(cat).length; });
 			body = '<div class="sl-tabs" role="tablist">' + parts.map(function(cat) {
 				var on = cat === tab;
 				return '<button class="sl-tab' + (on ? ' sl-tab-on' : '') + '" role="tab" aria-selected="' + on + '" data-tab="' + sl_esc(cat) + '">' +
 					'<span>' + sl_esc(cat) + '</span><span class="sl-count">' + in_part(cat).length + '</span></button>';
-			}).join('') + '</div>' + this.box(null, in_part(tab));
+			}).join('') + '</div>' + this.box(in_part(tab));
 		} else {
 			// A long list gets its own filter: the main store holds every item.
 			body = (place.rows.length > 15 ? '<input class="form-control sl-filter" data-item-filter placeholder="' + __('Find an item') + '">' : '') +
-				this.box(null, place.rows);
+				this.box(place.rows);
 		}
 		var $detail = this.$root.find('[data-detail]');
 		$detail.html([
 			'<div class="sl-head"><span class="sl-head-name">' + sl_esc(place.label) + '</span>',
 			place.sub ? '<span class="sl-head-sub">' + sl_esc(place.sub) + '</span>' : '',
-			'<span class="sl-head-count">' + sl_esc(__('{0} items', [place.rows.length])) + '</span></div>',
+			'<span class="sl-head-count">' + sl_esc(nch_stock.lines(place.rows.length)) + '</span></div>',
 			body
 		].join(''));
 		$detail.find('[data-tab]').on('click', (e) => {
@@ -197,14 +187,13 @@ class StockLocations {
 		});
 	}
 
-	box(title, rows) {
+	box(rows) {
 		return [
 			'<div class="sl-box">',
-			title ? '<div class="sl-box-head"><span>' + sl_esc(title) + '</span><span class="sl-count">' + rows.length + '</span></div>' : '',
 			rows.length
 				? rows.map(function(r) {
 					return '<div class="sl-row" data-row="' + sl_esc((r.item_code + ' ' + r.item_name).toLowerCase()) + '" title="' + sl_esc(r.item_code) + '">' +
-						'<span>' + sl_esc(r.item_name || r.item_code) + '</span><b>' + sl_esc(sl_qty(r.qty, r.uom)) + '</b></div>';
+						'<span>' + sl_esc(r.item_name || r.item_code) + '</span><b>' + sl_esc(nch_stock.amount(r.qty, r.uom)) + '</b></div>';
 				}).join('')
 				: '<div class="sl-empty">' + __('Empty') + '</div>',
 			'</div>'
@@ -253,12 +242,12 @@ class StockLocations {
 				items.map(function(item) {
 					return [
 						'<div class="sl-box sl-item">',
-						'<div class="sl-box-head"><span><b>' + sl_esc(item.item_name) + '</b> <span class="sl-code">' + sl_esc(item.item_code) + '</span></span>',
-						'<span class="sl-total">' + sl_esc(sl_qty(item.total, item.uom)) + '</span></div>',
+						'<div class="sl-box-head"><span><b>' + sl_esc(item.item_name) + '</b> <span class="sl-code">' + sl_esc(item.item_code) + (item.disabled ? ' · ' + sl_esc(__('disabled')) : '') + '</span></span>',
+						'<span class="sl-total">' + sl_esc(nch_stock.amount(item.total, item.uom)) + '</span></div>',
 						item.locations.length
 							? item.locations.map(function(l) {
 								return '<div class="sl-row"><span>' + sl_esc(l.where) + (l.kind ? ' <span class="sl-kind">' + sl_esc(l.kind) + '</span>' : '') + '</span>' +
-									'<b>' + sl_esc(sl_qty(l.qty, item.uom)) + '</b></div>';
+									'<b>' + sl_esc(nch_stock.amount(l.qty, item.uom)) + '</b></div>';
 							}).join('')
 							: '<div class="sl-empty">' + __('Not in stock anywhere') + '</div>',
 						'</div>'
