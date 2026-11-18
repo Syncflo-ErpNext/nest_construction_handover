@@ -195,6 +195,11 @@ def _qty(value):
 	return "{:g}".format(flt(value))
 
 
+def _unit(uom):
+	"""A unit worth saying after a quantity: " Meter", but nothing for plain Nos."""
+	return "" if not uom or uom == "Nos" else " " + uom
+
+
 def _rows(rows):
 	"""Lines arrive as JSON from the browser; keep those with an item and a quantity."""
 	if isinstance(rows, str):
@@ -280,8 +285,8 @@ def _check_free(lines, labels, items):
 		free = have.get((code, warehouse), 0) - promised.get((code, warehouse), 0)
 		if qty > free + EPSILON:
 			uom = items[code].stock_uom if code in items else ""
-			message = _("Only {0} {1} of {2} free in {3}, not {4}.").format(
-				_qty(max(free, 0)), uom, code, labels.get(warehouse, warehouse), _qty(qty)
+			message = _("Only {0}{1} of {2} free in {3}, not {4}.").format(
+				_qty(max(free, 0)), _unit(uom), code, labels.get(warehouse, warehouse), _qty(qty)
 			)
 			if promised.get((code, warehouse)):
 				message += " " + _("{0} more is already on its way and not yet accepted.").format(
@@ -426,11 +431,9 @@ def docket(name):
 	if not (receives or gives):
 		frappe.throw(_("{0} is not to or from you.").format(name), frappe.PermissionError)
 	labels = _labels(me.places)
-	# Into a van the driver picks the compartment per line: say which there are and
-	# what each line is set to now (blank when issued from a booking).
+	# Into a van the driver puts the whole handover in one part of the van: say which there are.
 	van = me.places.get(doc.to_warehouse) if me.places.get(doc.to_warehouse, {}).get("kind") == "van" else None
 	compartments = (van or {}).get("compartments") or {}
-	category_of = {leaf: category for category, leaf in compartments.items()}
 	booked_for = frappe.db.get_value("Material Request", doc.material_request, "set_warehouse") if doc.material_request else None
 	return {
 		"name": doc.name,
@@ -461,7 +464,6 @@ def docket(name):
 				"received": flt(item.qty_received),
 				"from": labels.get(item.s_warehouse) if item.s_warehouse else None,
 				"to": labels.get(item.t_warehouse) if item.t_warehouse else None,
-				"put": category_of.get(item.t_warehouse),
 			}
 			for item in doc.items
 		],
@@ -915,6 +917,8 @@ def book(store, site, rows):
 		)
 	booking.insert()
 	booking.submit()
+	# ERPNext's price-list notices mean nothing to a storeman.
+	frappe.local.message_log = []
 	return {"name": booking.name}
 
 
@@ -962,7 +966,6 @@ def issue(booking, van, docket_id=None):
 	doc.material_request = booking
 	doc.given_by = me.user
 	doc.given_at = now_datetime()
-	doc.notes = _("For {0}").format(found["site"])
 	for line in lines:
 		line.pop("qty")
 		# No t_warehouse: the driver chooses the part of the van when accepting.
@@ -988,8 +991,9 @@ def accept(name, counted=None, notes=None, put=None):
 	"""Count what arrived and accept it: one Stock Entry for what was counted.
 
 	`counted` maps a docket line to the quantity that arrived; a line not listed
-	arrived in full. What did not arrive stays where it was. Into a van, `put`
-	maps a line to the part of the van the driver put it in; the driver decides.
+	arrived in full. What did not arrive stays where it was. Into a van, `put` is
+	the one part of the van the driver puts the whole handover in; tools and
+	stock for a site travel on separate handovers.
 	"""
 	me = _me()
 	doc = _open(name)
@@ -1016,15 +1020,10 @@ def accept(name, counted=None, notes=None, put=None):
 	target = me.places.get(doc.to_warehouse) or {}
 	if target.get("kind") == "van":
 		compartments = target.get("compartments") or {}
-		chosen = json.loads(put) if isinstance(put, str) and put else (put or {})
+		if put not in compartments:
+			frappe.throw(_("Choose which part of {0} it all goes into.").format(target["label"]))
 		for item in arrived:
-			category = chosen.get(item.name)
-			if category:
-				if category not in compartments:
-					frappe.throw(_("{0}: {1} has no {2}.").format(item.item_code, target["label"], category))
-				item.t_warehouse = compartments[category]
-			elif item.t_warehouse not in compartments.values():
-				frappe.throw(_("Choose which part of {0} {1} goes into.").format(target["label"], item.item_code))
+			item.t_warehouse = compartments[put]
 
 	labels = _labels(me.places)
 	have = _on_hand(list({item.s_warehouse or doc.from_warehouse for item in arrived}))
@@ -1063,6 +1062,8 @@ def accept(name, counted=None, notes=None, put=None):
 		)
 	entry.insert()
 	entry.submit()
+	# ERPNext's valuation notices (e.g. an item with no cost yet) mean nothing to the driver.
+	frappe.local.message_log = []
 
 	doc.db_set({"status": "Posted", "stock_entry": entry.name, "post_error": None, "synced_at": now_datetime()})
 	return {"name": doc.name, "stock_entry": entry.name}
@@ -1189,7 +1190,7 @@ def receive(purchase_order, rows, delivery_note=None):
 		if qty is None:
 			continue
 		if qty > flt(item.qty) + EPSILON:
-			frappe.throw(_("Only {0} {1} of {2} is still to come.").format(_qty(item.qty), item.uom, item.item_code))
+			frappe.throw(_("Only {0}{1} of {2} is still to come.").format(_qty(item.qty), _unit(item.uom), item.item_code))
 		factor = flt(item.conversion_factor) or 1
 		item.qty = item.received_qty = qty
 		item.stock_qty = item.received_stock_qty = qty * factor

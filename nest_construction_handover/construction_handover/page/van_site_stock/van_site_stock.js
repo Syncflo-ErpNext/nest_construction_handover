@@ -54,6 +54,11 @@ function ch_qty(value) {
 	return String(parseFloat(flt(value).toFixed(4)));
 }
 
+// A unit worth saying after a quantity: " Meter", but nothing for plain Nos.
+function ch_unit(uom) {
+	return !uom || uom === 'Nos' ? '' : ' ' + uom;
+}
+
 function ch_icon(name) {
 	return '<i class="ph ph-' + name + '" aria-hidden="true"></i>';
 }
@@ -439,7 +444,7 @@ class ChStock {
 				'<div class="ch-row ch-row-static">',
 				'  <span class="ch-row-main">' + ch_esc(l.item_code) + '</span>',
 				'  <span class="ch-row-sub">' + ch_esc(l.item_name || '') + '</span>',
-				'  <span class="ch-row-right">' + ch_qty(l.to_go) + ' ' + ch_esc(l.uom || '') + (l.to_go < l.booked ? '<br><span class="ch-dim">' + ch_esc(__('of {0} booked', [ch_qty(l.booked)])) + '</span>' : '') + '</span>',
+				'  <span class="ch-row-right">' + ch_qty(l.to_go) + ch_esc(ch_unit(l.uom)) + (l.to_go < l.booked ? '<br><span class="ch-dim">' + ch_esc(__('of {0} booked', [ch_qty(l.booked)])) + '</span>' : '') + '</span>',
 				'</div>'
 			].join('\n')).join('\n'),
 			'</div>',
@@ -591,7 +596,7 @@ class ChStock {
 			'<div data-held></div>',
 			'<div class="ch-section">' + __('Going') + '</div>',
 			'<div class="ch-list" data-basket></div>',
-			'<label class="ch-label">' + __('Note (optional)') + '<input class="ch-text" data-note="1" autocomplete="off"></label>',
+			how.book ? '' : '<label class="ch-label">' + __('Note (optional)') + '<input class="ch-text" data-note="1" autocomplete="off"></label>',
 			'<div class="ch-actions"><button class="ch-submit" data-record="1">' + ch_icon('paper-plane-tilt') + '<span data-record-label></span></button></div>'
 		].join('\n'), 'send');
 
@@ -654,7 +659,7 @@ class ChStock {
 				this.held_rows.map((r, i) => {
 					// The compartment first: on a phone the end of the line is cut off.
 					var sub = (in_van ? ch_esc(this.compartment(r.warehouse)) + ' · ' : '') + ch_esc(r.item_name);
-					var right = ch_qty(r.free) + ' ' + ch_esc(r.stock_uom || '') + (r.free < r.qty ? '<br><span class="ch-dim">' + __('{0} on its way', [ch_qty(r.qty - r.free)]) + '</span>' : '');
+					var right = ch_qty(r.free) + ch_esc(ch_unit(r.stock_uom)) + (r.free < r.qty ? '<br><span class="ch-dim">' + __('{0} on its way', [ch_qty(r.qty - r.free)]) + '</span>' : '');
 					return this.row('data-held-row="' + i + '" data-filter="' + ch_esc((r.item_code + ' ' + r.item_name).toLowerCase()) + '"', ch_esc(r.item_code), sub, right);
 				}).join('\n'),
 				'</div>'
@@ -698,6 +703,7 @@ class ChStock {
 		}
 		var held = item.held || (this.held_rows || []).filter(function(r) { return r.item_code === item.item_code; });
 		var uom = item.stock_uom || '';
+		var unit = ch_unit(uom);
 
 		// Leaving a van: which compartment. Anywhere else: the place itself.
 		var sources = how.out_of_van
@@ -720,9 +726,9 @@ class ChStock {
 			this.ask(item, {
 				default: Math.min(1, sources[0].free) || sources[0].free,
 				max: free_of,
-				max_text: function(values) { return __('Only {0} {1} free there.', [ch_qty(free_of(values)), uom]); },
-				info: ch_esc(sources.length === 1 ? __('{0} {1} free to send.', [ch_qty(sources[0].free), uom]) : __('In more than one part of the van.')),
-				take: sources.length > 1 ? sources.map(function(s) { return { value: s.value, label: s.cat + ' · ' + ch_qty(s.free) + ' ' + uom }; }) : null,
+				max_text: function(values) { return __('Only {0}{1} free there.', [ch_qty(free_of(values)), unit]); },
+				info: ch_esc(sources.length === 1 ? __('{0}{1} free to send.', [ch_qty(sources[0].free), unit]) : __('In more than one part of the van.')),
+				take: sources.length > 1 ? sources.map(function(s) { return { value: s.value, label: s.cat + ' · ' + ch_qty(s.free) + unit }; }) : null,
 				take_default: sources[0].value,
 				put: category ? this.ctx.pickable.map(function(c) { return { value: c, label: c }; }) : null,
 				put_default: category
@@ -754,7 +760,7 @@ class ChStock {
 					'<div class="ch-row ch-row-static">',
 					'  <span class="ch-row-main">' + ch_esc(r.item_code) + '</span>',
 					'  <span class="ch-row-sub">' + ch_esc([r.item_name].concat(where).filter(Boolean).join(' · ')) + '</span>',
-					'  <span class="ch-row-right">' + ch_qty(r.qty) + ' ' + ch_esc(r.stock_uom || '') + '</span>',
+					'  <span class="ch-row-right">' + ch_qty(r.qty) + ch_esc(ch_unit(r.stock_uom)) + '</span>',
 					'  <button class="ch-remove" data-remove="' + i + '" aria-label="' + __('Remove') + '">' + ch_icon('x') + '</button>',
 					'</div>'
 				].join('\n');
@@ -808,11 +814,9 @@ class ChStock {
 	review(name) {
 		ch_call('docket', { name: name }).then((d) => {
 			this.counted = {};
-			this.put = {};
-			d.lines.forEach((l) => {
-				this.counted[l.row] = l.sent;
-				this.put[l.row] = l.put || '';
-			});
+			// Into a van, the one part of the van the whole handover goes in.
+			this.put = '';
+			d.lines.forEach((l) => { this.counted[l.row] = l.sent; });
 			this.paint_review(d);
 		});
 	}
@@ -850,7 +854,7 @@ class ChStock {
 				'  </select>',
 				'</label>'
 			].join('\n') : '',
-			'<div class="ch-section">' + (d.can_accept ? (d.into_van ? __('Count what arrived and where it goes (tap a line to change it)') : __('Count what arrived (tap a line to change it)')) : __('What was sent')) + '</div>',
+			'<div class="ch-section">' + (d.can_accept ? __('Count what arrived (tap a line to change it)') : __('What was sent')) + '</div>',
 			'<div class="ch-list" data-lines></div>',
 			d.can_accept ? '<label class="ch-label">' + __('Note (optional)') + '<input class="ch-text" data-note="1" autocomplete="off"></label>' : '',
 			d.can_accept ? '<button class="ch-secondary ch-quiet" data-reject="1">' + ch_icon('prohibit') + __('Turn it down') + '</button>' : '',
@@ -861,9 +865,7 @@ class ChStock {
 		this.bind_back(() => this.home());
 		this.paint_lines(d);
 		this.$root.find('[data-put-all]').on('change', (e) => {
-			var part = $(e.currentTarget).val();
-			if (!part) return;
-			d.lines.forEach((l) => { this.put[l.row] = part; });
+			this.put = $(e.currentTarget).val() || '';
 			this.paint_lines(d);
 		});
 		this.$root.find('[data-accept]').on('click', () => this.accept(d));
@@ -873,28 +875,24 @@ class ChStock {
 
 	paint_lines(d) {
 		var counted = this.counted;
-		var put = this.put || {};
 		var choosing = d.can_accept && d.into_van;
 		var $lines = this.$root.find('[data-lines]');
 		$lines.html(d.lines.map((l) => {
 			// Only a van's compartments are worth saying per line; the rest is on the card.
 			var where = [];
 			if (this.is_compartment(l.from)) where.push(__('from {0}', [this.compartment_of(l.from)]));
-			if (choosing) where.push(put[l.row] ? __('into {0}', [put[l.row]]) : __('where does it go?'));
-			else if (this.is_compartment(l.to)) where.push(__('into {0}', [this.compartment_of(l.to)]));
+			if (!choosing && this.is_compartment(l.to)) where.push(__('into {0}', [this.compartment_of(l.to)]));
 			var sub = ch_esc(where.concat([l.item_name]).filter(Boolean).join(' · '));
 			var right;
 			if (d.can_accept) {
 				var n = flt(counted[l.row]);
-				right = choosing && n > 0 && !put[l.row]
-					? this.tag(__('Choose where'), 'warn')
-					: (n === flt(l.sent)
-						? this.tag(__('All {0}', [ch_qty(l.sent) + ' ' + (l.uom || '')]), 'good')
-						: this.tag(__('{0} of {1}', [ch_qty(n), ch_qty(l.sent)]), 'warn'));
+				right = n === flt(l.sent)
+					? this.tag(__('All {0}', [ch_qty(l.sent) + ch_unit(l.uom)]), 'good')
+					: this.tag(__('{0} of {1}', [ch_qty(n), ch_qty(l.sent)]), 'warn');
 			} else if (d.status === 'Posted') {
-				right = flt(l.received) === flt(l.sent) ? ch_qty(l.sent) + ' ' + ch_esc(l.uom || '') : this.tag(__('{0} of {1}', [ch_qty(l.received), ch_qty(l.sent)]), 'warn');
+				right = flt(l.received) === flt(l.sent) ? ch_qty(l.sent) + ch_esc(ch_unit(l.uom)) : this.tag(__('{0} of {1}', [ch_qty(l.received), ch_qty(l.sent)]), 'warn');
 			} else {
-				right = ch_qty(l.sent) + ' ' + ch_esc(l.uom || '');
+				right = ch_qty(l.sent) + ch_esc(ch_unit(l.uom));
 			}
 			return this.row((d.can_accept ? '' : 'disabled ') + 'data-line="' + ch_esc(l.row) + '"', ch_esc(l.item_code), sub, right);
 		}).join('\n'));
@@ -906,25 +904,21 @@ class ChStock {
 					default: counted[l.row],
 					max: l.sent,
 					max_text: __('Only {0} was sent. Ask for the extra to be sent on its own.', [ch_qty(l.sent)]),
-					info: ch_esc(__('{0} {1} sent.', [ch_qty(l.sent), l.uom || ''])),
+					info: ch_esc(__('{0}{1} sent.', [ch_qty(l.sent), ch_unit(l.uom)])),
 					allow_zero: true,
-					action: __('Set'),
-					// Into a van the driver says where it goes; blank until they choose.
-					put: choosing ? [{ value: '', label: __('Choose a part of the van') }].concat(this.van_parts(d).map(function(c) { return { value: c, label: c }; })) : null,
-					put_default: put[l.row] || ''
-				}, (qty, values) => {
+					action: __('Set')
+				}, (qty) => {
 					counted[l.row] = qty;
-					if (choosing && values.put) put[l.row] = values.put;
 					this.paint_lines(d);
 				});
 			});
 			var short = d.lines.filter(function(l) { return flt(counted[l.row]) < flt(l.sent); }).length;
 			var arrived = d.lines.filter(function(l) { return flt(counted[l.row]) > 0; }).length;
-			var unplaced = choosing ? d.lines.filter(function(l) { return flt(counted[l.row]) > 0 && !put[l.row]; }).length : 0;
-			this.$root.find('[data-accept]').prop('disabled', !arrived || unplaced > 0);
+			var unplaced = choosing && !this.put;
+			this.$root.find('[data-accept]').prop('disabled', !arrived || unplaced);
 			this.$root.find('[data-accept-label]').text(!arrived
 				? __('Nothing counted in')
-				: (unplaced ? __('Choose where {0} goes', [unplaced === 1 ? __('1 line') : __('{0} lines', [unplaced])])
+				: (unplaced ? __('Choose the part of the van first')
 					: (short ? __('Accept, {0} short', [short === 1 ? __('1 line') : __('{0} lines', [short])]) : __('Accept {0}', [ch_lines(d.lines.length)]))));
 		}
 	}
@@ -943,7 +937,7 @@ class ChStock {
 		ch_call('accept', {
 			name: d.name,
 			counted: JSON.stringify(this.counted),
-			put: d.into_van ? JSON.stringify(this.put || {}) : '',
+			put: d.into_van ? (this.put || '') : '',
 			notes: this.$root.find('[data-note]').val() || ''
 		}, true).then((r) => {
 			this.done(__('Accepted into {0}', [d.to]), r.stock_entry + ' · ' + d.name, [
@@ -1087,8 +1081,8 @@ class ChStock {
 		this.ask(item, {
 			default: Math.min(1, free) || free,
 			max: free,
-			max_text: __('Only {0} {1} at this site.', [ch_qty(free), uom]),
-			info: ch_esc(__('{0} {1} at this site.', [ch_qty(free), uom]))
+			max_text: __('Only {0}{1} at this site.', [ch_qty(free), ch_unit(uom)]),
+			info: ch_esc(__('{0}{1} at this site.', [ch_qty(free), ch_unit(uom)]))
 		}, (qty) => {
 			var already = this.basket.filter(function(b) { return b.item_code === item.item_code; })[0];
 			if (already) already.qty += qty;
@@ -1163,7 +1157,7 @@ class ChStock {
 		$lines.html(o.lines.map((l) => {
 			var n = flt(counted[l.row]);
 			var right = n === flt(l.pending)
-				? this.tag(__('All {0}', [ch_qty(l.pending) + ' ' + (l.uom || '')]), 'good')
+				? this.tag(__('All {0}', [ch_qty(l.pending) + ch_unit(l.uom)]), 'good')
 				: this.tag(__('{0} of {1}', [ch_qty(n), ch_qty(l.pending)]), 'warn');
 			return this.row('data-line="' + ch_esc(l.row) + '"', ch_esc(l.item_code), ch_esc(l.item_name || ''), right);
 		}).join('\n'));
@@ -1174,7 +1168,7 @@ class ChStock {
 				default: counted[l.row],
 				max: l.pending,
 				max_text: __('Only {0} is still to come on this order. The office books in any extra.', [ch_qty(l.pending)]),
-				info: ch_esc(__('{0} {1} still to come.', [ch_qty(l.pending), l.uom || ''])),
+				info: ch_esc(__('{0}{1} still to come.', [ch_qty(l.pending), ch_unit(l.uom)])),
 				allow_zero: true,
 				action: __('Set')
 			}, (qty) => {
@@ -1217,7 +1211,7 @@ class ChStock {
 			var $box = this.$root.find('[data-stock]');
 			if (!rows.length) { $box.html('<div class="ch-note">' + __('Nothing here at the moment.') + '</div>'); return; }
 			var line = (r) => {
-				var right = ch_qty(r.qty) + ' ' + ch_esc(r.stock_uom || '') + (r.free < r.qty ? '<br><span class="ch-dim">' + __('{0} on its way out', [ch_qty(r.qty - r.free)]) + '</span>' : '');
+				var right = ch_qty(r.qty) + ch_esc(ch_unit(r.stock_uom)) + (r.free < r.qty ? '<br><span class="ch-dim">' + __('{0} on its way out', [ch_qty(r.qty - r.free)]) + '</span>' : '');
 				return this.row('disabled data-filter="' + ch_esc((r.item_code + ' ' + r.item_name).toLowerCase()) + '" data-held-row="1"', ch_esc(r.item_code), ch_esc(r.item_name), right);
 			};
 			if (here.kind === 'van') {
@@ -1270,13 +1264,13 @@ class ChStock {
 				'  <div class="ch-card-title">' + ch_esc(s.item_name || s.item_code) + '</div>',
 				'  <div class="ch-dim">' + ch_esc(s.item_code) + '</div>',
 				'  <div class="ch-totals">',
-				'    <div><b>' + ch_qty(s.on_hand) + '</b><span>' + ch_esc(uom) + ' ' + __('on hand') + '</span></div>',
-				'    <div><b>' + ch_qty(s.on_order) + '</b><span>' + ch_esc(uom) + ' ' + __('on order') + '</span></div>',
+				'    <div><b>' + ch_qty(s.on_hand) + '</b><span>' + ch_esc((ch_unit(uom) + ' ' + __('on hand')).trim()) + '</span></div>',
+				'    <div><b>' + ch_qty(s.on_order) + '</b><span>' + ch_esc((ch_unit(uom) + ' ' + __('on order')).trim()) + '</span></div>',
 				'  </div>',
 				'</div>',
 				rows.length ? '<div class="ch-section">' + __('Where it is') + '</div><div class="ch-list">' + rows.map((r) => {
 					var main = ch_esc(r.where) + (r.mine ? ' ' + this.tag(__('Yours')) : '');
-					return this.row('disabled', main, '', ch_qty(r.qty) + ' ' + ch_esc(uom));
+					return this.row('disabled', main, '', ch_qty(r.qty) + ch_esc(ch_unit(uom)));
 				}).join('\n') + '</div>' : '<div class="ch-note">' + __('None in stock anywhere.') + '</div>'
 			].join('\n'));
 		});
