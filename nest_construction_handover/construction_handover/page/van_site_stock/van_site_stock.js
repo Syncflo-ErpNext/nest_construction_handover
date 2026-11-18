@@ -14,7 +14,7 @@
 frappe.pages['van-site-stock'].on_page_load = function(wrapper) {
 	var page = frappe.ui.make_app_page({ parent: wrapper, title: __('Van & Site Stock'), single_column: true });
 
-	var BUILD_MARKER = 'v0.1.0-2026-10-12-first';
+	var BUILD_MARKER = 'v0.2.1-2026-11-18-van-tabs';
 	console.log('Van & Site Stock loaded:', BUILD_MARKER);
 
 	[
@@ -1215,12 +1215,36 @@ class ChStock {
 				return this.row('disabled data-filter="' + ch_esc((r.item_code + ' ' + r.item_name).toLowerCase()) + '" data-held-row="1"', ch_esc(r.item_code), ch_esc(r.item_name), right);
 			};
 			if (here.kind === 'van') {
-				$box.html(CH_COMPARTMENTS.map((cat) => {
-					var wh = (here.compartments || {})[cat];
-					var mine = rows.filter(function(r) { return r.warehouse === wh; });
-					return '<div class="ch-section">' + ch_esc(cat) + '</div>' +
-						(mine.length ? '<div class="ch-list">' + mine.map(line).join('\n') + '</div>' : '<div class="ch-note ch-note-small">' + __('Empty') + '</div>');
-				}).join('\n'));
+				// One tab per part of the van, and one tight line per item: a van holds a lot.
+				var parts = CH_COMPARTMENTS.filter(function(cat) { return (here.compartments || {})[cat]; });
+				var in_part = function(cat) { return rows.filter(function(r) { return r.warehouse === here.compartments[cat]; }); };
+				var kept_tab = ch_remembered('van-tab');
+				var tab = parts.indexOf(kept_tab) !== -1 ? kept_tab : (parts.filter(function(cat) { return in_part(cat).length; })[0] || parts[0]);
+				var compact = function(r) {
+					var out = r.free < r.qty ? '<small>' + ch_esc(__('{0} on its way out', [ch_qty(r.qty - r.free)])) + '</small>' : '';
+					return '<div class="ch-compact-row" data-held-row="1" data-filter="' + ch_esc((r.item_code + ' ' + r.item_name).toLowerCase()) + '">' +
+						'<span>' + ch_esc(r.item_name || r.item_code) + '</span><b>' + ch_qty(r.qty) + ch_esc(ch_unit(r.stock_uom)) + out + '</b></div>';
+				};
+				var paint_tab = () => {
+					var mine = in_part(tab);
+					$box.html([
+						'<div class="ch-tabs" role="tablist">',
+						parts.map(function(cat) {
+							var on = cat === tab;
+							return '<button class="ch-tab' + (on ? ' ch-tab-on' : '') + '" role="tab" aria-selected="' + on + '" data-tab="' + ch_esc(cat) + '">' +
+								'<span>' + ch_esc(cat) + '</span><b>' + in_part(cat).length + '</b></button>';
+						}).join('\n'),
+						'</div>',
+						mine.length ? '<div class="ch-compact">' + mine.map(compact).join('\n') + '</div>' : '<div class="ch-note ch-note-small">' + __('Empty') + '</div>'
+					].join('\n'));
+					$box.find('[data-tab]').on('click', (e) => {
+						tab = $(e.currentTarget).attr('data-tab');
+						ch_remember('van-tab', tab);
+						paint_tab();
+						this.filter_held(this.$root.find('[data-scan]').val());
+					});
+				};
+				paint_tab();
 			} else {
 				$box.html('<div class="ch-list">' + rows.map(line).join('\n') + '</div>');
 			}
