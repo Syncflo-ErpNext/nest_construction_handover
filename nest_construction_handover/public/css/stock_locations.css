@@ -134,12 +134,36 @@
 	font-size: 13px;
 }
 
-/* A van's compartments two across: four squeezes the descriptions. */
-.sl-parts {
-	display: grid;
-	grid-template-columns: repeat(2, minmax(0, 1fr));
-	gap: 12px;
-	align-items: start;
+/* A van's compartments as tabs: one compartment's items at a time. */
+.sl-tabs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	margin-bottom: 10px;
+}
+
+.sl-tab {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 10px 6px 12px;
+	font-size: 13px;
+	font-weight: 600;
+	color: var(--text-color);
+	background: var(--card-bg);
+	border: 1px solid var(--border-color);
+	border-radius: 8px;
+	cursor: pointer;
+}
+
+.sl-tab:hover {
+	background: var(--subtle-fg);
+}
+
+.sl-tab-on,
+.sl-tab-on:hover {
+	background: var(--subtle-accent, var(--subtle-fg));
+	border-color: var(--primary);
 }
 
 .sl-box {
@@ -148,10 +172,6 @@
 	border: 1px solid var(--border-color);
 	border-radius: 8px;
 	overflow: hidden;
-}
-
-.sl-parts .sl-box {
-	margin-bottom: 0;
 }
 
 .sl-box-head {
@@ -217,8 +237,7 @@
 }
 
 @media (max-width: 760px) {
-	.sl-layout,
-	.sl-parts {
+	.sl-layout {
 		grid-template-columns: minmax(0, 1fr);
 	}
 

@@ -10,7 +10,7 @@ frappe.pages['stock-locations'].on_page_load = function(wrapper) {
 	var page = frappe.ui.make_app_page({ parent: wrapper, title: __('Stock'), single_column: true });
 
 	// Bump with every stylesheet change so browsers fetch the new one.
-	var BUILD_MARKER = 'v0.2.1-2026-11-18-stock-locations';
+	var BUILD_MARKER = 'v0.2.2-2026-11-18-van-tabs';
 	if (!document.getElementById('sl-stylesheet')) {
 		var link = document.createElement('link');
 		link.id = 'sl-stylesheet';
@@ -69,11 +69,12 @@ class StockLocations {
 	open(force) {
 		var route = frappe.get_route() || [];
 		var view = SL_VIEWS[route[1]] ? route[1] : 'main';
+		// Every show: the desk puts the page's own title back when it is shown.
+		this.page.set_title(SL_VIEWS[view]);
 		var fresh = view !== this.view;
 		if (!fresh && !force && Date.now() - (this.opened_at || 0) < 2000) return;
 		this.view = view;
 		this.opened_at = Date.now();
-		this.page.set_title(SL_VIEWS[view]);
 
 		if (view === 'enquiry') {
 			if (fresh) this.paint_enquiry();
@@ -160,9 +161,17 @@ class StockLocations {
 		var place = this.places.filter((p) => p.name === this.current)[0];
 		var body;
 		if (this.view === 'vans') {
-			body = '<div class="sl-parts">' + SL_COMPARTMENTS.filter(function(cat) { return place.compartments.indexOf(cat) !== -1; }).map((cat) => {
-				return this.box(cat, place.rows.filter(function(r) { return r.category === cat; }));
-			}).join('\n') + '</div>';
+			// One tab per compartment. The tab chosen stays chosen from van to van;
+			// until one is chosen, a van opens on its first compartment with stock.
+			var parts = SL_COMPARTMENTS.filter(function(cat) { return place.compartments.indexOf(cat) !== -1; });
+			var in_part = function(cat) { return place.rows.filter(function(r) { return r.category === cat; }); };
+			if (this.tab === undefined) this.tab = sl_kept('van-tab') || null;
+			var tab = parts.indexOf(this.tab) !== -1 ? this.tab : (parts.filter(function(cat) { return in_part(cat).length; })[0] || parts[0]);
+			body = '<div class="sl-tabs" role="tablist">' + parts.map(function(cat) {
+				var on = cat === tab;
+				return '<button class="sl-tab' + (on ? ' sl-tab-on' : '') + '" role="tab" aria-selected="' + on + '" data-tab="' + sl_esc(cat) + '">' +
+					'<span>' + sl_esc(cat) + '</span><span class="sl-count">' + in_part(cat).length + '</span></button>';
+			}).join('') + '</div>' + this.box(null, in_part(tab));
 		} else {
 			// A long list gets its own filter: the main store holds every item.
 			body = (place.rows.length > 15 ? '<input class="form-control sl-filter" data-item-filter placeholder="' + __('Find an item') + '">' : '') +
@@ -175,6 +184,11 @@ class StockLocations {
 			'<span class="sl-head-count">' + sl_esc(__('{0} items', [place.rows.length])) + '</span></div>',
 			body
 		].join(''));
+		$detail.find('[data-tab]').on('click', (e) => {
+			this.tab = $(e.currentTarget).attr('data-tab');
+			sl_keep('van-tab', this.tab);
+			this.paint_detail();
+		});
 		$detail.find('[data-item-filter]').on('input', (e) => {
 			var typed = ($(e.currentTarget).val() || '').trim().toLowerCase();
 			$detail.find('[data-row]').each(function() {
