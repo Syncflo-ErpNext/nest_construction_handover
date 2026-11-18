@@ -937,3 +937,28 @@
 	font-weight: 500;
 	color: var(--ch-muted);
 }
+
+/* The store's way back to the desk, on the right of the store's banner. */
+.ch-hero-home {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	flex: none;
+	margin-left: auto;
+	padding: 8px 14px;
+	font-size: 15px;
+	font-weight: 600;
+	color: #fff;
+	background: rgba(255, 255, 255, 0.18);
+	border: 1px solid rgba(255, 255, 255, 0.4);
+	border-radius: 10px;
+	cursor: pointer;
+}
+
+.ch-hero-home:hover {
+	background: rgba(255, 255, 255, 0.28);
+}
+
+.ch-hero-home .ph {
+	font-size: 18px;
+}

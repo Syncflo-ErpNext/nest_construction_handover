@@ -14,7 +14,7 @@
 frappe.pages['van-site-stock'].on_page_load = function(wrapper) {
 	var page = frappe.ui.make_app_page({ parent: wrapper, title: __('Van & Site Stock'), single_column: true });
 
-	var BUILD_MARKER = 'v0.2.1-2026-11-18-van-tabs';
+	var BUILD_MARKER = 'v0.2.2-2026-11-18-issue-home';
 	console.log('Van & Site Stock loaded:', BUILD_MARKER);
 
 	[
@@ -126,17 +126,23 @@ class ChStock {
 	}
 
 	on_show() {
-		if (this.ctx && this.screen === 'home') this.refresh_inbox();
+		if (!this.ctx) return;
+		// A desk tile names its screen (van-site-stock/book, /issue): open it every time
+		// the tile is used, not only the first time this page loads.
+		var sub = (frappe.get_route() || [])[1];
+		if (sub) this.go(sub);
+		else if (this.screen === 'home') this.refresh_inbox();
 	}
 
-	// van-site-stock/book, /send-van, /deliver, /return-store, /return-van, /used, /receive,
-	// /stock, /find, /recent opens that screen (home tiles link here).
+	// van-site-stock/book, /issue, /send-van, /deliver, /return-store, /return-van, /used,
+	// /receive, /stock, /find, /recent opens that screen (desk tiles link here).
 	open_route() {
 		this.go((frappe.get_route() || [])[1] || 'home');
 	}
 
 	go(where) {
 		if (where === 'book') this.send('book');
+		else if (where === 'issue') this.issue_list();
 		else if (where === 'send-van') this.send('to-van');
 		else if (where === 'deliver') this.send('to-site');
 		else if (where === 'return-store') this.send('to-store');
@@ -380,6 +386,8 @@ class ChStock {
 			'    <div class="ch-hero-title">' + ch_esc(here) + '</div>',
 			'    <div class="ch-hero-sub">' + ch_esc(ctx.full_name) + ' · ' + ch_esc(role) + '</div>',
 			'  </div>',
+			// The store works from the desk: one tap back to it.
+			kind === 'store' ? '  <button class="ch-hero-home" data-desk="1">' + ch_icon('house') + __('Home') + '</button>' : '',
 			'</div>',
 			'<div data-incoming></div>',
 			'<div data-bookings></div>',
@@ -395,10 +403,27 @@ class ChStock {
 		].join('\n'), 'home');
 
 		this.$root.find('[data-go]').on('click', (e) => this.go($(e.currentTarget).attr('data-go')));
+		this.$root.find('[data-desk]').on('click', () => frappe.set_route((frappe.boot.versions || {}).nest_home ? 'nest-home' : ''));
 		this.bind_scan((term) => this.home_scan(term));
 		this.paint_inbox();
 		this.refresh_inbox();
 		if (kind === 'store') this.paint_bookings();
+	}
+
+	booking_rows(list) {
+		return list.map((b) => this.row(
+			'data-booking="' + ch_esc(b.name) + '"',
+			ch_esc(__('For {0}', [b.site])),
+			ch_esc([b.name, ch_lines(b.lines.length), b.by, ch_when(b.at)].join(' · ')),
+			this.tag(__('Issue'), 'go')
+		)).join('\n');
+	}
+
+	bind_bookings($box, list, back) {
+		$box.find('[data-booking]').on('click', (e) => {
+			var name = $(e.currentTarget).attr('data-booking');
+			this.issue_booking(list.filter(function(b) { return b.name === name; })[0], back);
+		});
 	}
 
 	// Booked to a site, not issued to a van yet: tap one to issue it.
@@ -410,24 +435,41 @@ class ChStock {
 				'<div class="ch-waiting">',
 				'  <div class="ch-waiting-head">' + ch_icon('clipboard-text') + ch_esc(list.length === 1 ? __('1 booking to issue to a van') : __('{0} bookings to issue to a van', [list.length])) + '</div>',
 				'  <div class="ch-list">',
-				list.map((b) => this.row(
-					'data-booking="' + ch_esc(b.name) + '"',
-					ch_esc(__('For {0}', [b.site])),
-					ch_esc([b.name, ch_lines(b.lines.length), b.by, ch_when(b.at)].join(' · ')),
-					this.tag(__('Issue'), 'go')
-				)).join('\n'),
+				this.booking_rows(list),
 				'  </div>',
 				'</div>'
 			].join('\n') : '');
-			$box.find('[data-booking]').on('click', (e) => {
-				var name = $(e.currentTarget).attr('data-booking');
-				this.issue_booking(list.filter(function(b) { return b.name === name; })[0]);
-			});
+			this.bind_bookings($box, list, () => this.home());
+		});
+	}
+
+	// The Issue to Van screen: every booking waiting to go out, nothing else.
+	issue_list() {
+		this.render([
+			this.head(__('Issue to a van'), __('Stock booked to sites, waiting to go out'), true),
+			'<div data-issue-list><div class="ch-note">' + __('Loading...') + '</div></div>'
+		].join('\n'), 'issue-list');
+		this.bind_back(() => this.home());
+		ch_call('bookings').then((list) => {
+			if (this.screen !== 'issue-list') return;
+			var $box = this.$root.find('[data-issue-list]');
+			if (!list.length) {
+				$box.html([
+					'<div class="ch-note">' + __('Nothing is booked and waiting to go out.') + '</div>',
+					'<button class="ch-secondary" data-book="1">' + ch_icon('clipboard-text') + __('Book stock to a site') + '</button>'
+				].join('\n'));
+				$box.find('[data-book]').on('click', () => this.send('book'));
+				return;
+			}
+			$box.html('<div class="ch-list">' + this.booking_rows(list) + '</div>');
+			this.bind_bookings($box, list, () => this.issue_list());
 		});
 	}
 
 	// Issue a booking to a van exactly as booked: pick the van, tap Issue.
-	issue_booking(b) {
+	// back: where the back arrow goes, the screen the booking was picked from.
+	issue_booking(b, back) {
+		back = back || (() => this.home());
 		var vans = this.ctx.vans;
 		var kept = ch_remembered('issue:van');
 		this.to = vans.some(function(v) { return v.name === kept; }) ? kept : (vans.length === 1 ? vans[0].name : '');
@@ -451,7 +493,7 @@ class ChStock {
 			this.place_field('to', __('Van'), vans, this.to, __('Choose the van')),
 			'<div class="ch-actions"><button class="ch-submit" data-issue="1">' + ch_icon('paper-plane-tilt') + '<span data-issue-label></span></button></div>'
 		].join('\n'), 'issue');
-		this.bind_back(() => this.home());
+		this.bind_back(back);
 		var label = () => {
 			var van = this.place(this.to);
 			this.$root.find('[data-issue]').prop('disabled', !van);
@@ -468,7 +510,8 @@ class ChStock {
 			if (!van) return;
 			ch_call('issue', { booking: b.name, van: van.name, docket_id: this.docket_id }, true).then((r) => {
 				this.done(__('Issued to {0}', [van.label]), r.name + ' · ' + __('nothing moves until the driver counts it and accepts'), [
-					{ label: __('Home'), primary: true, fn: () => this.home() }
+					{ label: __('Issue another'), primary: true, fn: () => this.issue_list() },
+					{ label: __('Home'), fn: () => this.home() }
 				]);
 			});
 		});
