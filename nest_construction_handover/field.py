@@ -1587,7 +1587,9 @@ def use(store, rows, notes=None):
 	place = me.places.get(store)
 	if not place or place["kind"] != "site":
 		frappe.throw(_("Choose the site the goods were used on."))
-	if store not in me.mine and me.kind != "van" and not me.office:
+	# A driver who runs sites records only on those; other drivers on any site.
+	any_site = me.kind == "van" and not me.managed
+	if store not in me.mine and store not in me.managed and not any_site and not me.office:
 		frappe.throw(_("You can only record what was used on your own sites."), frappe.PermissionError)
 	project = place.get("project")
 	if not project:

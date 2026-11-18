@@ -439,8 +439,8 @@ class ChStock {
 			'    <div class="ch-hero-title">' + ch_esc(here) + '</div>',
 			'    <div class="ch-hero-sub">' + ch_esc(ctx.full_name) + ' · ' + ch_esc(role) + '</div>',
 			'  </div>',
-			// The store works from the desk: one tap back to it.
-			kind === 'store' ? '  <button class="ch-hero-home" data-desk="1">' + ch_icon('house') + __('Home') + '</button>' : '',
+			// One tap back to the desk, from the store, a van or a site.
+			'  <button class="ch-hero-home" data-desk="1">' + ch_icon('house') + __('Home') + '</button>',
 			'</div>',
 			'<div data-incoming></div>',
 			'<div data-bookings></div>',
@@ -717,8 +717,8 @@ class ChStock {
 		this.render([
 			this.head(how.title, source ? __('From {0}', [source.label]) : '', true),
 			'<div class="ch-pair">',
-			this.place_field('from', __('From'), ctx.mine, this.from, __('Choose where from')),
-			this.place_field('to', __('To'), this.due ? this.due_first(targets) : (how.book ? ch_by_label(targets) : targets), this.to, __('Choose where to')),
+			this.place_field('from', __('From'), ch_by_label(ctx.mine), this.from, __('Choose where from')),
+			this.place_field('to', __('To'), this.due ? this.due_first(ch_by_label(targets)) : ch_by_label(targets), this.to, __('Choose where to')),
 			projects.length ? [
 				'<label class="ch-label">' + __('For a project? (optional)'),
 				'  <select class="ch-select" data-project="1">',
@@ -731,9 +731,10 @@ class ChStock {
 			'<div data-route-note></div>',
 			this.scan_box(__('Scan or type an item')),
 			'<div data-results></div>',
-			'<div data-held></div>',
+			// What is going first, in its own colour; what else is here, to add from, below it.
 			'<div class="ch-section">' + __('Going') + '</div>',
 			'<div class="ch-list" data-basket></div>',
+			'<div data-held></div>',
 			how.book ? '' : '<label class="ch-label">' + __('Note (optional)') + '<input class="ch-text" data-note="1" autocomplete="off"></label>',
 			'<div class="ch-actions"><button class="ch-submit" data-record="1">' + ch_icon('paper-plane-tilt') + '<span data-record-label></span></button></div>'
 		].join('\n'), 'send');
@@ -901,7 +902,8 @@ class ChStock {
 				var cat = this.compartment(r.s_warehouse);
 				if (cat) where.push(__('from {0}', [cat]));
 				return [
-					'<div class="ch-row ch-row-static"' + (changeable ? ' data-line-qty="' + i + '" style="cursor: pointer"' : '') + '>',
+					// Going lines in green, so they never look like the stock still to choose from.
+					'<div class="ch-row ch-row-static' + (changeable ? ' ch-row-booked" data-line-qty="' + i + '" style="cursor: pointer"' : '"') + '>',
 					'  <span class="ch-row-main">' + ch_esc(r.item_code) + '</span>',
 					'  <span class="ch-row-sub">' + ch_esc([r.item_name].concat(where).filter(Boolean).join(' · ')) + '</span>',
 					'  <span class="ch-row-right">' + ch_esc(ch_amount(r.qty, r.stock_uom)) + '</span>',
@@ -1146,7 +1148,9 @@ class ChStock {
 
 	use() {
 		var ctx = this.ctx;
-		var sites = ctx.kind === 'site' ? ctx.mine : ctx.sites;
+		// A driver who runs sites records what was used on his own sites only.
+		var run = this.all.managed || [];
+		var sites = ctx.kind === 'site' ? ctx.mine : (run.length ? run : ctx.sites);
 		sites = sites.filter(function(s) { return s.project; });
 		if (sites.length === 1) { this.use_at(sites[0]); return; }
 		this.pick_site(__('Used on site'), sites, (site) => this.use_at(site));
@@ -1161,7 +1165,8 @@ class ChStock {
 		this.bind_back(() => this.back_home());
 
 		var kept = ch_remembered('site');
-		var ordered = sites.slice().sort(function(a, b) { return (b.name === kept) - (a.name === kept); });
+		// A-Z, so a site is where you expect it; the last one used keeps its tag.
+		var ordered = ch_by_label(sites);
 		var paint = (filter) => {
 			var f = (filter || '').toLowerCase();
 			var shown = ordered.filter(function(s) { return !f || [s.label, s.project_name].some(function(v) { return String(v || '').toLowerCase().indexOf(f) !== -1; }); });
@@ -1396,16 +1401,18 @@ class ChStock {
 				var right = ch_esc(ch_amount(r.qty, r.stock_uom)) + (r.free < r.qty ? '<br><span class="ch-dim">' + __('{0} on its way out', [ch_qty(r.qty - r.free)]) + '</span>' : '');
 				return this.row('disabled data-filter="' + ch_esc((r.item_code + ' ' + r.item_name).toLowerCase()) + '" data-held-row="1"', ch_esc(r.item_code), ch_esc(r.item_name), right);
 			};
+			// One tight line per item, name and amount (the code still finds it): vans and
+			// sites hold a lot.
+			var compact = function(r) {
+				var out = r.free < r.qty ? '<small>' + ch_esc(__('{0} on its way out', [ch_qty(r.qty - r.free)])) + '</small>' : '';
+				return '<div class="ch-compact-row" data-held-row="1" data-filter="' + ch_esc((r.item_code + ' ' + r.item_name).toLowerCase()) + '">' +
+					'<span>' + ch_esc(r.item_name || r.item_code) + '</span><b>' + ch_esc(ch_amount(r.qty, r.stock_uom)) + out + '</b></div>';
+			};
 			if (here.kind === 'van') {
-				// One tab per part of the van, and one tight line per item: a van holds a lot.
+				// One tab per part of the van.
 				var parts = CH_COMPARTMENTS.filter(function(cat) { return (here.compartments || {})[cat]; });
 				var in_part = function(cat) { return rows.filter(function(r) { return r.warehouse === here.compartments[cat]; }); };
 				var tab = nch_stock.first_tab(parts, ch_remembered('van-tab'), function(cat) { return in_part(cat).length; });
-				var compact = function(r) {
-					var out = r.free < r.qty ? '<small>' + ch_esc(__('{0} on its way out', [ch_qty(r.qty - r.free)])) + '</small>' : '';
-					return '<div class="ch-compact-row" data-held-row="1" data-filter="' + ch_esc((r.item_code + ' ' + r.item_name).toLowerCase()) + '">' +
-						'<span>' + ch_esc(r.item_name || r.item_code) + '</span><b>' + ch_esc(ch_amount(r.qty, r.stock_uom)) + out + '</b></div>';
-				};
 				var paint_tab = () => {
 					var mine = in_part(tab);
 					$box.html([
@@ -1426,6 +1433,8 @@ class ChStock {
 					});
 				};
 				paint_tab();
+			} else if (here.kind === 'site') {
+				$box.html('<div class="ch-compact">' + rows.map(compact).join('\n') + '</div>');
 			} else {
 				$box.html('<div class="ch-list">' + rows.map(line).join('\n') + '</div>');
 			}
