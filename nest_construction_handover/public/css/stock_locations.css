@@ -1,0 +1,233 @@
+/* Stock Locations: the office's desktop stock views (main store, vans, sites, enquiry). */
+
+.sl-root {
+	padding: 4px 0 24px;
+	color: var(--text-color);
+}
+
+.sl-layout {
+	display: grid;
+	grid-template-columns: 260px minmax(0, 1fr);
+	gap: 16px;
+	align-items: start;
+}
+
+.sl-single {
+	grid-template-columns: minmax(0, 1fr);
+}
+
+/* The list of places stays in view while the chosen one is read. */
+.sl-side {
+	position: sticky;
+	top: calc(var(--navbar-height, 48px) + 12px);
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	max-height: calc(100vh - 140px);
+}
+
+.sl-places {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	overflow-y: auto;
+	padding-right: 2px;
+}
+
+.sl-place {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	grid-template-areas: "name count" "sub count";
+	align-items: center;
+	column-gap: 8px;
+	flex: none;
+	padding: 8px 12px;
+	text-align: left;
+	color: var(--text-color);
+	background: var(--card-bg);
+	border: 1px solid var(--border-color);
+	border-radius: 8px;
+	cursor: pointer;
+}
+
+.sl-place:hover {
+	background: var(--subtle-fg);
+}
+
+.sl-place-on,
+.sl-place-on:hover {
+	background: var(--subtle-accent, var(--subtle-fg));
+	border-color: var(--primary);
+}
+
+.sl-place-name {
+	grid-area: name;
+	font-weight: 600;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.sl-place-sub {
+	grid-area: sub;
+	font-size: 12px;
+	color: var(--text-muted);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.sl-place .sl-count {
+	grid-area: count;
+}
+
+.sl-count {
+	min-width: 24px;
+	padding: 1px 7px;
+	font-size: 12px;
+	font-weight: 600;
+	text-align: center;
+	color: var(--text-muted);
+	background: var(--subtle-fg);
+	border-radius: 999px;
+	font-variant-numeric: tabular-nums;
+}
+
+.sl-check {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin: 0;
+	font-size: 13px;
+	color: var(--text-muted);
+	cursor: pointer;
+}
+
+.sl-filter {
+	margin-bottom: 10px;
+}
+
+.sl-side .sl-filter {
+	margin-bottom: 0;
+}
+
+.sl-head {
+	display: flex;
+	align-items: baseline;
+	flex-wrap: wrap;
+	gap: 4px 10px;
+	margin-bottom: 10px;
+}
+
+.sl-head-name {
+	font-size: 18px;
+	font-weight: 700;
+}
+
+.sl-head-sub,
+.sl-head-count {
+	color: var(--text-muted);
+}
+
+.sl-head-count {
+	margin-left: auto;
+	font-size: 13px;
+}
+
+/* A van's compartments two across: four squeezes the descriptions. */
+.sl-parts {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 12px;
+	align-items: start;
+}
+
+.sl-box {
+	margin-bottom: 12px;
+	background: var(--card-bg);
+	border: 1px solid var(--border-color);
+	border-radius: 8px;
+	overflow: hidden;
+}
+
+.sl-parts .sl-box {
+	margin-bottom: 0;
+}
+
+.sl-box-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	padding: 8px 12px;
+	font-size: 13px;
+	font-weight: 600;
+	background: var(--subtle-fg);
+	border-bottom: 1px solid var(--border-color);
+}
+
+.sl-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 6px 12px;
+	font-size: 13px;
+	border-top: 1px solid var(--border-color);
+}
+
+.sl-box > .sl-row:first-child,
+.sl-box-head + .sl-row {
+	border-top: none;
+}
+
+.sl-row span {
+	min-width: 0;
+	line-height: 1.3;
+}
+
+.sl-row b,
+.sl-total {
+	flex: none;
+	font-variant-numeric: tabular-nums;
+}
+
+.sl-code,
+.sl-kind {
+	margin-left: 4px;
+	font-size: 12px;
+	font-weight: 400;
+	color: var(--text-muted);
+}
+
+.sl-empty,
+.sl-note {
+	padding: 10px 12px;
+	font-size: 13px;
+	color: var(--text-muted);
+}
+
+.sl-enquiry {
+	max-width: 760px;
+}
+
+.sl-search {
+	margin-bottom: 12px;
+	font-size: 15px;
+}
+
+@media (max-width: 760px) {
+	.sl-layout,
+	.sl-parts {
+		grid-template-columns: minmax(0, 1fr);
+	}
+
+	.sl-side {
+		position: static;
+		max-height: none;
+	}
+
+	.sl-places {
+		max-height: 260px;
+	}
+}

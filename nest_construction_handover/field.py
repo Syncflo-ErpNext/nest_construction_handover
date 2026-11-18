@@ -21,6 +21,7 @@ Every Stock Entry is built and submitted with the user's own permissions.
 """
 
 import json
+import re
 
 import frappe
 from frappe import _
@@ -478,6 +479,144 @@ def held(location):
 	if not place:
 		frappe.throw(_("{0} is not a store, van or site.").format(location))
 	return _held(_warehouses_of(place), _labels(me.places))
+
+
+# ---- the office's desktop stock views ---------------------------------------
+
+STOCK_VIEWS = {"main": "store", "vans": "van", "sites": "site"}
+KIND_LABELS = {"store": "Main store", "van": "Van", "site": "Site"}
+
+
+def _office():
+	me = _me()
+	if not (me.office or me.kind == "store"):
+		frappe.throw(_("Only the office and the store see every stock location."), frappe.PermissionError)
+	return me
+
+
+def _natural(label):
+	"""Sort key that puts VAN2 before VAN10."""
+	return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", label or "")]
+
+
+@frappe.whitelist()
+def stock_view(view):
+	"""Every place of one kind with what is in it now: the main store, every van
+	(by compartment) or every site."""
+	me = _office()
+	kind = STOCK_VIEWS.get(view)
+	if not kind:
+		frappe.throw(_("{0} is not a stock view.").format(view))
+	places = sorted((p for p in me.places.values() if p["kind"] == kind), key=lambda p: _natural(p["label"]))
+
+	owner = {}  # warehouse -> (place, compartment)
+	for place in places:
+		if kind == "van":
+			for category, leaf in (place.get("compartments") or {}).items():
+				owner[leaf] = (place["name"], category)
+		else:
+			owner[place["name"]] = (place["name"], None)
+	rows_of = {}
+	for row in _held(list(owner), {}) if owner else []:
+		name, category = owner[row["warehouse"]]
+		rows_of.setdefault(name, []).append(
+			{
+				"category": category,
+				"item_code": row["item_code"],
+				"item_name": row["item_name"],
+				"uom": row["stock_uom"],
+				"qty": row["qty"],
+			}
+		)
+	# Only the description shows, so list by it.
+	for rows in rows_of.values():
+		rows.sort(key=lambda r: (r["item_name"] or r["item_code"]).lower())
+
+	def sub(place):
+		if kind == "van":
+			return place.get("driver")
+		if kind == "site":
+			manager = get_fullname(place["site_manager"]) if place.get("site_manager") else None
+			return " · ".join(filter(None, [place.get("project_name"), manager]))
+		return None
+
+	return [
+		{
+			"name": place["name"],
+			"label": place["label"],
+			"sub": sub(place),
+			"compartments": list(place.get("compartments") or {}),
+			"rows": rows_of.get(place["name"], []),
+		}
+		for place in places
+	]
+
+
+@frappe.whitelist()
+def enquiry(term):
+	"""Where an item is: every store, van compartment and site holding it, and how
+	much. Matches an item code, a barcode or part of the code or description."""
+	me = _office()
+	term = (term or "").strip()
+	if not term:
+		return []
+	base = {"disabled": 0, "is_stock_item": 1}
+	fields = ["name", "item_name", "stock_uom"]
+	items = frappe.get_all("Item", filters=dict(base, name=term), fields=fields)
+	if not items:
+		coded = frappe.get_all("Item Barcode", filters={"barcode": term}, pluck="parent", limit=SEARCH_LIMIT)
+		if coded:
+			items = frappe.get_all("Item", filters=dict(base, name=["in", coded]), fields=fields)
+	if not items:
+		like = f"%{term}%"
+		items = frappe.get_all(
+			"Item",
+			filters=base,
+			or_filters={"name": ["like", like], "item_name": ["like", like]},
+			fields=fields,
+			order_by="name asc",
+			limit=SEARCH_LIMIT,
+		)
+	if not items:
+		return []
+
+	labels = _labels(me.places)
+	kind_of = {}
+	for place in me.places.values():
+		for warehouse in _warehouses_of(place):
+			kind_of[warehouse] = place["kind"]
+	order = {"store": 0, "van": 1, "site": 2}
+	where = {}
+	for row in frappe.get_all(
+		"Bin",
+		filters={"item_code": ["in", [item.name for item in items]], "actual_qty": [">", 0]},
+		fields=["item_code", "warehouse", "actual_qty"],
+	):
+		where.setdefault(row.item_code, []).append(row)
+
+	out = []
+	for item in items:
+		rows = sorted(
+			where.get(item.name, []),
+			key=lambda r: (order.get(kind_of.get(r.warehouse), 3), _natural(labels.get(r.warehouse, r.warehouse))),
+		)
+		out.append(
+			{
+				"item_code": item.name,
+				"item_name": item.item_name,
+				"uom": item.stock_uom,
+				"total": sum(flt(r.actual_qty) for r in rows),
+				"locations": [
+					{
+						"where": labels.get(r.warehouse, r.warehouse),
+						"kind": _(KIND_LABELS[kind_of[r.warehouse]]) if r.warehouse in kind_of else "",
+						"qty": flt(r.actual_qty),
+					}
+					for r in rows
+				],
+			}
+		)
+	return out
 
 
 @frappe.whitelist()

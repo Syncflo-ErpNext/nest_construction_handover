@@ -1,0 +1,27 @@
+{
+ "creation": "2026-11-18 10:00:00.000000",
+ "docstatus": 0,
+ "doctype": "Page",
+ "icon": "warehouse",
+ "idx": 0,
+ "modified": "2026-11-18 10:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Construction Handover",
+ "name": "stock-locations",
+ "owner": "Administrator",
+ "page_name": "stock-locations",
+ "restrict_to_domain": "",
+ "roles": [
+  {
+   "role": "Stock Manager"
+  },
+  {
+   "role": "System Manager"
+  }
+ ],
+ "script": null,
+ "standard": "Yes",
+ "style": null,
+ "system_page": 0,
+ "title": "Stock Locations"
+}
