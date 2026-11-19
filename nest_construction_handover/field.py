@@ -25,10 +25,11 @@ import re
 
 import frappe
 from frappe import _
-from frappe.utils import flt, get_fullname, now_datetime, nowdate
+from frappe.utils import cint, flt, format_datetime, get_datetime, get_fullname, now_datetime, nowdate, strip_html
 
 DOCKET = "Stock Handover Docket"
 DOCKET_ITEM = "Stock Handover Docket Item"
+FIELD_CAPTURE = "Field Capture"
 
 # A van is a group warehouse with one compartment under it per category
 # (Warehouse.van_category): Goods In Transit, Van Stock, Technician Tools, Assets.
@@ -122,9 +123,10 @@ def _me():
 	"""Who is asking and which places are theirs. Anyone with no place is refused.
 
 	A whitelisted method is callable by any logged-in user, so this is the
-	permission check, not the screen's own navigation.
+	permission check, not the screen's own navigation. While the storeman tries a
+	field record again (sort_capture), it is the person who recorded it.
 	"""
-	me = _whoami()
+	me = _whoami(frappe.flags.nch_as_user)
 	if not me:
 		frappe.throw(
 			_("You have no store, van or site to work from. Ask the office to set Assigned Warehouse on your user."),
@@ -133,9 +135,9 @@ def _me():
 	return me
 
 
-def _whoami():
-	"""Who is asking and which places are theirs, or None if they have none."""
-	user = frappe.session.user
+def _whoami(user=None):
+	"""Who is asking (or `user`) and which places are theirs, or None if they have none."""
+	user = user or frappe.session.user
 	roles = set(frappe.get_roles(user))
 	places = _places()
 
@@ -357,7 +359,10 @@ def _public(place):
 @frappe.whitelist()
 def bootstrap():
 	"""Everything the screen needs to open."""
-	me = _me()
+	return _bootstrap(_me())
+
+
+def _bootstrap(me):
 	places = me.places
 
 	def listed(kind):
@@ -382,6 +387,13 @@ def bootstrap():
 		"purchasing": bool(me.roles & PURCHASING_ROLES) and "nest_po_management" in frappe.get_installed_apps(),
 		"receive_at": _receiving_sites(me),
 		"inbox": _inbox(me),
+		# What this person recorded with no signal that could not post: with the storeman.
+		"sorting": frappe.get_all(
+			FIELD_CAPTURE,
+			filters={"user": me.user, "status": "Needs sorting"},
+			fields=["name", "summary", "recorded_at", "error"],
+			order_by="recorded_at asc",
+		),
 	}
 
 
@@ -457,7 +469,10 @@ def _summaries(dockets, places):
 @frappe.whitelist()
 def docket(name):
 	"""One handover, with its lines, and what I may do with it."""
-	me = _me()
+	return _docket(_me(), name)
+
+
+def _docket(me, name):
 	doc = frappe.get_doc(DOCKET, name)
 	receives, gives = _receives(me, doc), _gives(me, doc)
 	if not (receives or gives):
@@ -470,6 +485,8 @@ def docket(name):
 		"status": doc.status,
 		"from": labels.get(doc.from_warehouse, doc.from_warehouse),
 		"to": labels.get(doc.to_warehouse, doc.to_warehouse),
+		"from_warehouse": doc.from_warehouse,
+		"to_warehouse": doc.to_warehouse,
 		"into_van": target.get("kind") == "van",
 		"compartments": list(target.get("compartments") or {}),
 		"project": doc.project,
@@ -1048,7 +1065,8 @@ def send(from_location, to_location, rows, project=None, notes=None, docket_id=N
 	doc.to_warehouse = to_location
 	doc.project = project
 	doc.given_by = me.user
-	doc.given_at = now_datetime()
+	doc.given_at = _now()
+	doc.captured_offline = 1 if frappe.flags.nch_recorded_at else 0
 	doc.notes = (notes or "").strip() or None
 	for line in lines:
 		line.pop("qty")
@@ -1424,10 +1442,26 @@ def _open(name):
 	return doc
 
 
+def _now():
+	"""When it happened: the time a phone with no signal recorded it, else now."""
+	return frappe.flags.nch_recorded_at or now_datetime()
+
+
 def _post(doc):
 	"""Save and submit what the field recorded, then drop ERPNext's passing pop-up
 	notices (a price list applied, an item with no cost yet): they are for the office,
-	not the field. Real messages, the ones shown in a dialog, are kept."""
+	not the field. Real messages, the ones shown in a dialog, are kept.
+
+	Recorded with no signal (capture), it is dated when it was recorded, not when the
+	phone got signal, and says so."""
+	when = frappe.flags.nch_recorded_at
+	if when:
+		doc.set_posting_time = 1
+		doc.posting_date = when.date()
+		doc.posting_time = when.strftime("%H:%M:%S")
+		doc.remarks = "\n".join(
+			filter(None, [doc.remarks, _("Recorded with no signal at {0}.").format(format_datetime(when))])
+		)
 	doc.insert()
 	doc.submit()
 
@@ -1497,9 +1531,11 @@ def accept(name, counted=None, notes=None, put=None):
 			)
 
 	doc.received_by = me.user
-	doc.received_at = now_datetime()
+	doc.received_at = _now()
 	if (notes or "").strip():
 		_add_note(doc, _("On receipt: {0}").format(notes.strip()))
+	if frappe.flags.nch_recorded_at:
+		_add_note(doc, _("Accepted with no signal at {0}.").format(format_datetime(doc.received_at)))
 	doc.save()
 
 	entry = frappe.new_doc("Stock Entry")
@@ -1634,26 +1670,34 @@ def deliveries(site):
 		_check_store(me, site)
 		return _store_deliveries(site)
 	_check_receiver(me, site)
+	return _site_deliveries([site])[site]
+
+
+def _site_deliveries(sites):
+	"""Approved purchase orders raised for these sites with something still to arrive:
+	site -> orders. The caller has checked the sites are this person's to book in."""
+	result = {site: [] for site in sites}
+	if not sites:
+		return result
 	orders = frappe.get_all(
 		"Purchase Order",
 		filters={
 			"docstatus": 1,
-			"po_site": site,
+			"po_site": ["in", sites],
 			"per_received": ["<", 100],
 			"status": ["not in", ["Closed", "On Hold"]],
 		},
-		fields=["name", "supplier", "supplier_name", "schedule_date"],
+		fields=["name", "supplier", "supplier_name", "schedule_date", "po_site"],
 		order_by="schedule_date asc, name asc",
 	)
 	if not orders:
-		return []
+		return result
 	lines = frappe.get_all(
 		"Purchase Order Item",
 		filters={"parenttype": "Purchase Order", "parent": ["in", [o.name for o in orders]]},
 		fields=["name", "parent", "item_code", "item_name", "uom", "qty", "received_qty", "delivered_by_supplier"],
 		order_by="parent asc, idx asc",
 	)
-	result = []
 	for order in orders:
 		rows = [
 			{
@@ -1669,7 +1713,7 @@ def deliveries(site):
 			and flt(line.qty) - flt(line.received_qty) > EPSILON
 		]
 		if rows:
-			result.append(
+			result[order.po_site].append(
 				{"name": order.name, "supplier": order.supplier_name or order.supplier, "due": order.schedule_date, "lines": rows}
 			)
 	return result
@@ -1907,3 +1951,234 @@ def use(store, rows, notes=None, site=None):
 		entry.append("items", row)
 	_post(entry)
 	return {"name": entry.name, "project": project}
+
+
+# ---- working with no signal ---------------------------------------------------
+#
+# A field phone keeps a snapshot of what its screen shows, so it opens and works with
+# no signal. Everything it records goes through capture(), sent once under an id made
+# on the phone: with signal at once, with none from the phone's queue when signal
+# returns, dated when it was recorded. A record from the queue that cannot post (the
+# stock moved meanwhile) never goes negative: it waits for the storeman as Needs
+# sorting, and he tries it again or drops it. Store work stays online.
+
+# What a field phone may record, and the arguments each takes.
+CAPTURES = {
+	"send": ("from_location", "to_location", "rows", "project", "notes", "docket_id"),
+	"accept": ("name", "counted", "notes", "put"),
+	"reject": ("name", "reason"),
+	"use": ("store", "rows", "notes", "site"),
+	"collect": ("purchase_order", "rows", "delivery_note"),
+	"receive": ("purchase_order", "rows", "delivery_note"),
+}
+
+
+@frappe.whitelist()
+def snapshot():
+	"""What a field phone keeps to work with no signal: its screen, the stock at its own
+	places, what is due on its van, the handovers waiting with their lines, orders to
+	collect or book in, and the item list for scanning. Nothing for a store."""
+	me = _me()
+	if me.kind == "store":
+		return None
+	places = me.places
+	own = me.mine + me.managed
+	part_of = {warehouse: name for name in own for warehouse in _warehouses_of(places[name])}
+	held = {name: [] for name in own}
+	for row in _held(list(part_of), _labels(places)) if part_of else []:
+		held[part_of[row["warehouse"]]].append(row)
+
+	boot = _bootstrap(me)
+	dockets = {d["name"]: _docket(me, d["name"]) for d in boot["inbox"]["incoming"] + boot["inbox"]["sent"]}
+	van = places[me.mine[0]] if me.kind == "van" else None
+
+	barcodes = {}
+	for row in frappe.get_all("Item Barcode", filters={"parenttype": "Item"}, fields=["parent", "barcode"]):
+		barcodes.setdefault(row.parent, []).append(row.barcode)
+	items = [
+		{
+			"item_code": item.name,
+			"item_name": item.item_name,
+			"stock_uom": item.stock_uom,
+			"tracked": bool(item.has_serial_no or item.has_batch_no),
+			"barcodes": barcodes.get(item.name, []),
+		}
+		for item in frappe.get_all(
+			"Item",
+			filters={"disabled": 0, "is_stock_item": 1},
+			fields=["name", "item_name", "stock_uom", "has_serial_no", "has_batch_no"],
+			order_by="name asc",
+		)
+	]
+	return {
+		"at": now_datetime(),
+		"bootstrap": boot,
+		"held": held,
+		"due": due(van["name"]) if van else {},
+		"dockets": dockets,
+		"collections": collections() if van else [],
+		"deliveries": _site_deliveries(boot["receive_at"]),
+		"items": items,
+	}
+
+
+def _run(action, args):
+	"""Do what the phone recorded, with only the arguments that action takes."""
+	actions = {"send": send, "accept": accept, "reject": reject, "use": use, "collect": collect, "receive": receive}
+	return actions[action](**{key: args[key] for key in CAPTURES[action] if args.get(key) is not None})
+
+
+def _captured(capture_id, user):
+	"""A record already sent: what became of it. Only the person who sent it may ask."""
+	row = frappe.db.get_value(FIELD_CAPTURE, capture_id, ["user", "status", "result", "error"], as_dict=True)
+	if not row:
+		return None
+	if row.user != user:
+		frappe.throw(_("This record belongs to someone else."), frappe.PermissionError)
+	return {"status": row.status, "result": json.loads(row.result) if row.result else None, "error": row.error}
+
+
+def _recorded_at(value):
+	"""When the phone says it was recorded, never later than now (a clock running fast)."""
+	try:
+		when = get_datetime(value) if value else None
+	except (TypeError, ValueError):
+		when = None
+	now = now_datetime()
+	return min(when, now) if when else now
+
+
+@frappe.whitelist()
+def capture(capture_id, action, args, summary=None, recorded_at=None, offline=0):
+	"""One thing recorded on a field phone, sent once: the same id sent again returns
+	what happened the first time instead of posting twice.
+
+	With signal (offline 0) it posts at once and any refusal shows on the phone as
+	before. From the phone's queue (offline 1) it is dated `recorded_at`; if it cannot
+	post, nothing moves and it waits for the storeman as Needs sorting.
+	"""
+	me = _me()
+	capture_id = str(capture_id or "").strip()
+	if not re.fullmatch(r"[A-Za-z0-9]{8,40}", capture_id):
+		frappe.throw(_("This record has no proper id. Record it again."))
+	if action not in CAPTURES:
+		frappe.throw(_("{0} cannot be recorded from a phone.").format(action))
+	done = _captured(capture_id, me.user)
+	if done:
+		return done
+	if isinstance(args, str):
+		args = json.loads(args)
+	if not isinstance(args, dict):
+		frappe.throw(_("This record could not be read. Record it again."))
+
+	offline = cint(offline)
+	when = _recorded_at(recorded_at) if offline else None
+	record = {
+		"doctype": FIELD_CAPTURE,
+		"capture_id": capture_id,
+		"user": me.user,
+		"action": action,
+		"summary": (summary or "").strip()[:140] or None,
+		"args": json.dumps(args),
+		"recorded_at": when or now_datetime(),
+		"offline": offline,
+		"status": "Posting",
+	}
+	try:
+		log = frappe.get_doc(record).insert()
+	except frappe.DuplicateEntryError:
+		# The phone sent it twice at once: the first one decides.
+		return _captured(capture_id, me.user) or {"status": "Posting"}
+
+	frappe.flags.nch_recorded_at = when
+	try:
+		result = _run(action, args)
+	except Exception as e:
+		if not offline:
+			raise
+		error = strip_html(str(e)).strip() or _("It could not be posted.")
+		# Undo everything it did, then keep the record for the storeman.
+		frappe.db.rollback()
+		frappe.local.message_log = []
+		try:
+			frappe.get_doc(dict(record, status="Needs sorting", error=error)).insert()
+		except frappe.DuplicateEntryError:
+			return _captured(capture_id, me.user)
+		return {"status": "Needs sorting", "error": error}
+	finally:
+		frappe.flags.nch_recorded_at = None
+
+	log.db_set({"status": "Posted", "result": json.dumps(result, default=str)})
+	if offline:
+		# Sent from the queue in the background: ERPNext's messages are not for the phone.
+		frappe.local.message_log = []
+	return {"status": "Posted", "result": result}
+
+
+def _sorter():
+	me = _me()
+	if not (me.kind == "store" or me.office):
+		frappe.throw(_("Only the storeman sorts records that could not post."), frappe.PermissionError)
+	return me
+
+
+@frappe.whitelist()
+def needs_sorting():
+	"""Records from field phones that could not post, oldest first: the storeman's list."""
+	_sorter()
+	rows = frappe.get_all(
+		FIELD_CAPTURE,
+		filters={"status": "Needs sorting"},
+		fields=["name", "user", "action", "summary", "recorded_at", "error"],
+		order_by="recorded_at asc",
+	)
+	for row in rows:
+		row["by"] = get_fullname(row.user)
+	return rows
+
+
+@frappe.whitelist()
+def sort_capture(capture_id, how, note=None):
+	"""The storeman tries a record again once the stock is right, or drops it with a reason."""
+	me = _sorter()
+	log = frappe.get_doc(FIELD_CAPTURE, capture_id)
+	if log.status != "Needs sorting":
+		frappe.throw(_("This record was already sorted."))
+	if how == "drop":
+		note = (note or "").strip()
+		if not note:
+			frappe.throw(_("Say why it is dropped."))
+		# Set by the server only: nobody edits a field record on the desk (no write permission).
+		log.db_set({"status": "Dropped", "sorted_by": me.user, "sorted_at": now_datetime(), "sort_note": note})
+		return {"status": "Dropped"}
+	if how != "retry":
+		frappe.throw(_("Try it again or drop it."))
+
+	# Run exactly as it was recorded: as the person who recorded it, so their places and
+	# their checks apply (_me reads nch_as_user), and dated when it was recorded. The
+	# documents are still made with the storeman's own permissions.
+	frappe.flags.nch_as_user = log.user
+	frappe.flags.nch_recorded_at = get_datetime(log.recorded_at) if log.offline else None
+	try:
+		result = _run(log.action, json.loads(log.args or "{}"))
+	finally:
+		frappe.flags.nch_as_user = None
+		frappe.flags.nch_recorded_at = None
+	log.db_set(
+		{
+			"status": "Posted",
+			"result": json.dumps(result, default=str),
+			"sorted_by": me.user,
+			"sorted_at": now_datetime(),
+		}
+	)
+	return {"status": "Posted", "result": result}
+
+
+@frappe.whitelist()
+def sorting_counts():
+	"""Needs Sorting tile: records from field phones that could not post (red)."""
+	me = _whoami()
+	if not me or not (me.kind == "store" or me.office):
+		return _two_counts(0, 0)
+	return _two_counts(frappe.db.count(FIELD_CAPTURE, {"status": "Needs sorting"}), 0)

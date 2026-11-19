@@ -1,0 +1,195 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:capture_id",
+ "creation": "2026-11-19 18:00:00.000000",
+ "description": "One thing recorded on a field phone (a handover, a count, a use, a collection or a delivery), sent once. Records made with no signal are dated when they were recorded; one that cannot post waits here for the storeman, marked Needs sorting.",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "capture_id",
+  "status",
+  "action",
+  "summary",
+  "cb_head",
+  "user",
+  "recorded_at",
+  "offline",
+  "sb_result",
+  "result",
+  "error",
+  "sb_sorted",
+  "sorted_by",
+  "sorted_at",
+  "cb_sorted",
+  "sort_note",
+  "sb_args",
+  "args"
+ ],
+ "fields": [
+  {
+   "description": "Made on the phone, so sending the same record twice posts it once.",
+   "fieldname": "capture_id",
+   "fieldtype": "Data",
+   "label": "Capture ID",
+   "read_only": 1,
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "Posting\nPosted\nNeeds sorting\nDropped",
+   "read_only": 1
+  },
+  {
+   "fieldname": "action",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Action",
+   "options": "send\naccept\nreject\nuse\ncollect\nreceive",
+   "read_only": 1
+  },
+  {
+   "fieldname": "summary",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "What",
+   "read_only": 1
+  },
+  {
+   "fieldname": "cb_head",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "user",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "Recorded by",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "recorded_at",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Recorded at",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "offline",
+   "fieldtype": "Check",
+   "label": "Recorded with no signal",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sb_result",
+   "fieldtype": "Section Break",
+   "label": "Result"
+  },
+  {
+   "fieldname": "result",
+   "fieldtype": "Small Text",
+   "label": "Posted as",
+   "read_only": 1
+  },
+  {
+   "fieldname": "error",
+   "fieldtype": "Small Text",
+   "label": "Why it could not post",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sb_sorted",
+   "fieldtype": "Section Break",
+   "label": "Sorted"
+  },
+  {
+   "fieldname": "sorted_by",
+   "fieldtype": "Link",
+   "label": "Sorted by",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sorted_at",
+   "fieldtype": "Datetime",
+   "label": "Sorted at",
+   "read_only": 1
+  },
+  {
+   "fieldname": "cb_sorted",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "sort_note",
+   "fieldtype": "Small Text",
+   "label": "Why it was dropped",
+   "read_only": 1
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "sb_args",
+   "fieldtype": "Section Break",
+   "label": "As recorded"
+  },
+  {
+   "fieldname": "args",
+   "fieldtype": "Code",
+   "label": "Arguments",
+   "options": "JSON",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-11-19 18:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Construction Handover",
+ "name": "Field Capture",
+ "naming_rule": "By fieldname",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Stock Manager"
+  },
+  {
+   "create": 1,
+   "if_owner": 1,
+   "read": 1,
+   "role": "Stock User"
+  },
+  {
+   "create": 1,
+   "if_owner": 1,
+   "read": 1,
+   "role": "Site User"
+  }
+ ],
+ "search_fields": "summary,user,status",
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "summary",
+ "track_changes": 1
+}

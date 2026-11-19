@@ -14,7 +14,7 @@
 frappe.pages['van-site-stock'].on_page_load = function(wrapper) {
 	var page = frappe.ui.make_app_page({ parent: wrapper, title: __('Van & Site Stock'), single_column: true });
 
-	var BUILD_MARKER = 'v0.2.3-2026-11-18-instock-colour';
+	var BUILD_MARKER = 'v0.3.0-2026-11-19-no-signal';
 	console.log('Van & Site Stock loaded:', BUILD_MARKER);
 
 	[
@@ -83,13 +83,456 @@ function ch_projects(sites) {
 	return ch_by_label(Object.keys(by).map(function(key) { return by[key]; }));
 }
 
+// A read from the server. With no signal a field phone answers from what it saved
+// (ch_answer); anything else says it needs signal.
 function ch_call(method, args, freeze) {
-	return frappe.call({
-		method: CH_API + method,
-		args: args || {},
-		freeze: !!freeze,
-		freeze_message: freeze ? __('Recording...') : undefined
-	}).then(function(r) { return r.message; });
+	args = args || {};
+	if (ch_no_signal()) return ch_answer(method, args);
+	// What was recorded with no signal goes first, so the answer already counts it.
+	return ch_flush().then(function() {
+		if (ch_no_signal()) return ch_answer(method, args);
+		return frappe.call({
+			method: CH_API + method,
+			args: args,
+			freeze: !!freeze,
+			freeze_message: freeze ? __('Recording...') : undefined
+		}).then(function(r) {
+			ch_kept(method, args, r.message);
+			return r.message;
+		}, function(xhr) {
+			if (ch_lost(xhr)) return ch_answer(method, args);
+			return Promise.reject(xhr);
+		});
+	});
+}
+
+// ---- working with no signal ------------------------------------------------
+//
+// A field phone keeps a snapshot of what its screen shows (field.snapshot) and a queue
+// of what was recorded with no signal, per person, in this browser's storage. Reads
+// with no signal come from the snapshot, with everything recorded since applied, so it
+// is already off the lists and cannot be recorded twice. Everything recorded goes
+// through field.capture under an id made here: sending it again posts it once. From the
+// queue it is dated when it was recorded; if it cannot post, it waits for the storeman.
+// The service worker (/nch_sw.js) opens the desk itself with no signal. Store work
+// stays online.
+
+var CH_OFF = { signal: navigator.onLine !== false, field: false, flushing: null, changed: null, watching: false, stuck: false };
+// What the phone can answer with no signal.
+var CH_READS = ['bootstrap', 'inbox', 'held', 'due', 'docket', 'collections', 'deliveries', 'recent', 'resolve_scan'];
+
+function ch_key(what) {
+	return 'nch:' + what + ':' + frappe.session.user;
+}
+
+function ch_load(what, fallback) {
+	try {
+		var value = localStorage.getItem(ch_key(what));
+		return value ? JSON.parse(value) : fallback;
+	} catch (e) {
+		return fallback;
+	}
+}
+
+function ch_save(what, value) {
+	try {
+		localStorage.setItem(ch_key(what), JSON.stringify(value));
+		return true;
+	} catch (e) {
+		return false;
+	}
+}
+
+function ch_queue() {
+	return ch_load('queue', []);
+}
+
+function ch_no_signal() {
+	return !CH_OFF.signal || navigator.onLine === false;
+}
+
+function ch_signal(on) {
+	if (CH_OFF.signal === on) return;
+	CH_OFF.signal = on;
+	if (CH_OFF.changed) CH_OFF.changed();
+}
+
+// A request that never reached the server: no signal.
+function ch_lost(xhr) {
+	if (!xhr || xhr.status !== 0) return false;
+	ch_signal(false);
+	return true;
+}
+
+function ch_say(message) {
+	frappe.show_alert({ message: ch_esc(message), indicator: 'orange' }, 6);
+	return Promise.reject(new Error(message));
+}
+
+// Handovers seen and the Recent list, for looking at with no signal.
+function ch_kept(method, args, value) {
+	if (!CH_OFF.field || (method !== 'docket' && method !== 'recent')) return;
+	var reads = ch_load('reads', {});
+	var key = method + ':' + (args.name || '');
+	delete reads[key];
+	reads[key] = value;
+	var keys = Object.keys(reads);
+	keys.slice(0, Math.max(keys.length - 60, 0)).forEach(function(k) { delete reads[k]; });
+	ch_save('reads', reads);
+}
+
+// A read answered on the phone, from what it saw last with signal.
+function ch_answer(method, args) {
+	if (CH_READS.indexOf(method) === -1) return ch_say(__('No signal. This needs signal: try again when you have it.'));
+	var seen = ch_seen();
+	if (!seen) return ch_say(__('No signal, and nothing is saved on this phone yet. Open this screen once with signal.'));
+	var reads = ch_load('reads', {});
+	var answer = {
+		bootstrap: () => seen.bootstrap,
+		inbox: () => seen.bootstrap.inbox,
+		held: () => seen.held[args.location],
+		due: () => seen.due,
+		docket: () => seen.dockets[args.name] || reads['docket:' + args.name],
+		collections: () => seen.collections,
+		deliveries: () => (seen.deliveries || {})[args.site],
+		recent: () => reads['recent:'],
+		resolve_scan: () => ch_scan(seen, args)
+	}[method]();
+	if (answer === undefined) return ch_say(__('No signal, and this is not saved on the phone. Open it once with signal.'));
+	return Promise.resolve(answer);
+}
+
+// The snapshot as it stands now: everything recorded since it was taken applied.
+function ch_seen() {
+	var snap = ch_load('snap', null);
+	if (!snap) return null;
+	var seen = JSON.parse(JSON.stringify(snap));
+	var info = {};
+	(seen.items || []).forEach(function(item) { info[item.item_code] = item; });
+	ch_load('sent', []).concat(ch_queue()).forEach(function(item) { ch_apply(seen, info, item); });
+	// As on the server (field.due): never more due than is free in that part of the van.
+	var van = seen.bootstrap.kind === 'van' ? (seen.bootstrap.mine || [])[0] : null;
+	if (van && seen.due) {
+		Object.keys(seen.due).forEach(function(project) {
+			var lines = seen.due[project].map(function(l) {
+				var row = (seen.held[van.name] || []).filter(function(r) { return r.item_code === l.item_code && r.warehouse === l.s_warehouse; })[0];
+				return $.extend(l, { qty: Math.min(l.qty, row ? row.free : 0) });
+			}).filter(function(l) { return l.qty > 1e-9; });
+			if (lines.length) seen.due[project] = lines;
+			else delete seen.due[project];
+		});
+	}
+	return seen;
+}
+
+function ch_place_in(boot, name) {
+	return [].concat(boot.mine || [], boot.managed || [], boot.stores || [], boot.vans || [], boot.sites || []).filter(function(p) { return p.name === name; })[0] || {};
+}
+
+// Stock at one of my places: qty < 0 takes away (moved: it left; else only spoken for
+// on a handover not yet accepted), qty > 0 puts stock in.
+function ch_held_change(seen, info, place, warehouse, code, qty, moved) {
+	var rows = seen.held[place];
+	if (!rows || !warehouse) return;
+	var row = rows.filter(function(r) { return r.item_code === code && r.warehouse === warehouse; })[0];
+	if (!row) {
+		if (qty <= 0) return;
+		var item = info[code] || {};
+		row = { item_code: code, item_name: item.item_name || code, stock_uom: item.stock_uom || '', tracked: false, warehouse: warehouse, where: '', qty: 0, free: 0 };
+		rows.push(row);
+	}
+	if (qty > 0) {
+		row.qty += qty;
+		row.free += qty;
+	} else {
+		row.free = Math.max(row.free + qty, 0);
+		if (moved) row.qty = Math.max(row.qty + qty, 0);
+	}
+	seen.held[place] = rows.filter(function(r) { return r.qty > 1e-9; });
+}
+
+// What my van holds for a project.
+function ch_due_change(seen, info, project, warehouse, code, qty) {
+	if (!project || !seen.due) return;
+	var lines = seen.due[project] || [];
+	var line = lines.filter(function(l) { return l.item_code === code && l.s_warehouse === warehouse; })[0];
+	if (!line) {
+		if (qty <= 0) return;
+		var item = info[code] || {};
+		line = { item_code: code, item_name: item.item_name || code, stock_uom: item.stock_uom || '', s_warehouse: warehouse, qty: 0 };
+		lines.push(line);
+	}
+	line.qty += qty;
+	lines = lines.filter(function(l) { return l.qty > 1e-9; });
+	if (lines.length) seen.due[project] = lines;
+	else delete seen.due[project];
+}
+
+function ch_json(value, fallback) {
+	if (typeof value !== 'string') return value || fallback;
+	try { return JSON.parse(value || 'null') || fallback; } catch (e) { return fallback; }
+}
+
+// One recorded thing, applied to what the phone saw: the same effect the server's
+// answer would show once it is posted.
+function ch_apply(seen, info, item) {
+	var a = item.args || {};
+	var boot = seen.bootstrap;
+	var rows = ch_json(a.rows, []);
+	var van = boot.kind === 'van' && boot.mine[0] ? boot.mine[0] : null;
+	var my_van = van ? van.name : null;
+	var inbox = boot.inbox = boot.inbox || { incoming: [], sent: [] };
+
+	if (item.action === 'send') {
+		var from = ch_place_in(boot, a.from_location);
+		var to = ch_place_in(boot, a.to_location);
+		var project = from.kind === 'van' ? (to.kind === 'site' ? to.project : a.project) : null;
+		rows.forEach(function(r) {
+			var warehouse = r.s_warehouse || a.from_location;
+			ch_held_change(seen, info, a.from_location, warehouse, r.item_code, -flt(r.qty), item.straight);
+			if (item.straight) ch_held_change(seen, info, a.to_location, a.to_location, r.item_code, flt(r.qty));
+			if (a.from_location === my_van) ch_due_change(seen, info, project, warehouse, r.item_code, -flt(r.qty));
+		});
+		if (!item.straight) {
+			inbox.sent.unshift({
+				name: item.queued ? '' : (item.result || {}).name, queued: !!item.queued, to: to.label || a.to_location,
+				from_warehouse: a.from_location, to_warehouse: a.to_location, preview: item.summary || '', at: item.at
+			});
+		}
+	} else if (item.action === 'use') {
+		var site = ch_place_in(boot, a.site);
+		rows.forEach(function(r) {
+			var warehouse = r.s_warehouse || a.store;
+			ch_held_change(seen, info, a.store, warehouse, r.item_code, -flt(r.qty), true);
+			if (a.store === my_van) ch_due_change(seen, info, site.project, warehouse, r.item_code, -flt(r.qty));
+		});
+	} else if (item.action === 'accept' || item.action === 'reject') {
+		inbox.incoming = (inbox.incoming || []).filter(function(d) { return d.name !== a.name; });
+		var d = seen.dockets[a.name];
+		if (!d) return;
+		d.can_accept = false;
+		if (item.action !== 'accept') return;
+		var counted = ch_json(a.counted, {});
+		var target = ch_place_in(boot, d.to_warehouse);
+		var into = d.into_van ? (target.compartments || {})[a.put] : d.to_warehouse;
+		d.lines.forEach(function(l) {
+			var n = counted[l.row] != null ? flt(counted[l.row]) : flt(l.sent);
+			if (n <= 0) return;
+			ch_held_change(seen, info, d.to_warehouse, into, l.item_code, n);
+			if (d.to_warehouse === my_van) ch_due_change(seen, info, d.project, into, l.item_code, n);
+		});
+	} else if (item.action === 'collect') {
+		var order = (seen.collections || []).filter(function(o) { return o.name === a.purchase_order; })[0];
+		if (!order || !van) return;
+		var git = (van.compartments || {})['Goods In Transit'];
+		var job = ch_place_in(boot, order.site).project;
+		rows.forEach(function(r) {
+			var line = order.lines.filter(function(l) { return l.row === r.po_detail; })[0];
+			if (!line) return;
+			line.pending -= flt(r.qty);
+			ch_held_change(seen, info, my_van, git, line.item_code, flt(r.qty));
+			ch_due_change(seen, info, job, git, line.item_code, flt(r.qty));
+		});
+		order.lines = order.lines.filter(function(l) { return l.pending > 1e-9; });
+		seen.collections = seen.collections.filter(function(o) { return o.lines.length; });
+	} else if (item.action === 'receive') {
+		Object.keys(seen.deliveries || {}).forEach(function(at) {
+			seen.deliveries[at].forEach(function(o) {
+				if (o.name !== a.purchase_order) return;
+				rows.forEach(function(r) {
+					var line = o.lines.filter(function(l) { return l.row === r.po_detail; })[0];
+					if (!line) return;
+					line.pending -= flt(r.qty);
+					ch_held_change(seen, info, at, at, line.item_code, flt(r.qty));
+				});
+				o.lines = o.lines.filter(function(l) { return l.pending > 1e-9; });
+			});
+			seen.deliveries[at] = seen.deliveries[at].filter(function(o) { return o.lines.length; });
+		});
+	}
+}
+
+// A scan or typed item with no signal: from the item list the phone keeps.
+function ch_scan(seen, args) {
+	var term = String(args.term || '').trim();
+	var low = term.toLowerCase();
+	var held = args.location ? seen.held[args.location] : null;
+	var shaped = function(item) {
+		var out = { item_code: item.item_code, item_name: item.item_name, stock_uom: item.stock_uom, tracked: item.tracked };
+		if (held) out.held = held.filter(function(r) { return r.item_code === item.item_code; });
+		return out;
+	};
+	if (!term) return { type: 'unknown', label: __('Nothing scanned.') };
+	var items = seen.items || [];
+	var exact = items.filter(function(i) { return i.item_code.toLowerCase() === low || (i.barcodes || []).indexOf(term) !== -1; });
+	if (exact.length === 1) return { type: 'item', value: exact[0].item_code, label: exact[0].item_code, item: shaped(exact[0]) };
+	if (exact.length > 1) return { type: 'unknown', label: __('{0} is on more than one item.', [term]), suggestions: exact.map(shaped) };
+	return {
+		type: 'unknown',
+		label: __('Nothing matches {0}.', [term]),
+		suggestions: items.filter(function(i) { return (i.item_code + ' ' + i.item_name).toLowerCase().indexOf(low) !== -1; }).slice(0, 20).map(shaped)
+	};
+}
+
+// What a record says in a list: "To Tower 2: Bends × 2, Pipes × 4".
+function ch_summary(what, lines) {
+	var list = (lines || []).map(function(l) { return (l.item_name || l.item_code) + ' × ' + ch_qty(l.qty); });
+	var text = list.slice(0, 3).join(', ') + (list.length > 3 ? ' ' + __('and {0} more', [list.length - 3]) : '');
+	return what + (text ? ': ' + text : '');
+}
+
+// Record something. With signal it posts now and any refusal shows as before; with
+// none (or signal lost on the way) a field phone keeps it in the queue: {queued: true}.
+// extra: {id} for the screen's own id (a second tap sends the same record), {straight}
+// for a handover that goes straight in.
+function ch_write(action, args, summary, extra) {
+	var item = $.extend({ id: frappe.utils.get_random(20), action: action, args: args, summary: summary, at: frappe.datetime.now_datetime() }, extra || {});
+	var keep = function() {
+		if (!CH_OFF.field) return ch_say(__('No signal. Store work needs signal: try again when you have it.'));
+		return ch_enqueue(item);
+	};
+	if (ch_no_signal()) return keep();
+	return ch_flush().then(function() {
+		// Older records still waiting go first: this one waits behind them.
+		if (ch_no_signal() || ch_queue().length) return keep();
+		return frappe.call({
+			method: CH_API + 'capture',
+			args: { capture_id: item.id, action: action, args: JSON.stringify(args), summary: summary },
+			freeze: true,
+			freeze_message: __('Recording...')
+		}).then(function(r) {
+			var out = r.message || {};
+			if (out.status !== 'Posted') return { status: out.status, error: out.error };
+			ch_sent(item, out.result);
+			return out.result || {};
+		}, function(xhr) {
+			if (ch_lost(xhr)) return keep();
+			return Promise.reject(xhr);
+		});
+	});
+}
+
+function ch_enqueue(item) {
+	item.queued = true;
+	var queue = ch_queue();
+	if (!queue.some(function(q) { return q.id === item.id; })) queue.push(item);
+	if (!ch_save('queue', queue)) return ch_say(__('This phone could not save it. Free some space, or record it again with signal.'));
+	if (CH_OFF.changed) CH_OFF.changed();
+	return Promise.resolve({ queued: true });
+}
+
+// Posted since the snapshot was taken: still applied to it until a new one counts it.
+function ch_sent(item, result) {
+	var seq = ch_load('seq', 0) + 1;
+	ch_save('seq', seq);
+	var sent = ch_load('sent', []);
+	sent.push($.extend({}, item, { queued: false, result: result || {}, seq: seq }));
+	ch_save('sent', sent.slice(-100));
+}
+
+// Send what was recorded with no signal, oldest first. Stops when signal goes again.
+function ch_flush() {
+	if (CH_OFF.flushing) return CH_OFF.flushing;
+	// Refused by the server itself (signed out, a fault): not again on every tap; the
+	// half-minute check (ch_watch_signal) tries again.
+	if (!ch_queue().length || ch_no_signal() || CH_OFF.stuck) return Promise.resolve();
+	var posted = 0;
+	var held = 0;
+	CH_OFF.flushing = new Promise(function(resolve) {
+		var next = function() {
+			var item = ch_queue()[0];
+			if (!item || ch_no_signal()) return resolve();
+			frappe.call({
+				method: CH_API + 'capture',
+				args: { capture_id: item.id, action: item.action, args: JSON.stringify(item.args), summary: item.summary, recorded_at: item.at, offline: 1 }
+			}).then(function(r) {
+				var out = r.message || {};
+				ch_save('queue', ch_queue().filter(function(q) { return q.id !== item.id; }));
+				if (out.status === 'Posted') {
+					posted += 1;
+					ch_sent(item, out.result);
+				} else if (out.status === 'Needs sorting') {
+					held += 1;
+				}
+				next();
+			}, function(xhr) {
+				// No signal, or the server refused the call itself (signed out): the rest waits.
+				if (!ch_lost(xhr)) CH_OFF.stuck = true;
+				resolve();
+			});
+		};
+		next();
+	}).then(function() {
+		CH_OFF.flushing = null;
+		if (posted) frappe.show_alert({ message: ch_esc(posted === 1 ? __('1 record made with no signal is sent.') : __('{0} records made with no signal are sent.', [posted])), indicator: 'green' }, 6);
+		if (held) frappe.show_alert({ message: ch_esc(held === 1 ? __('1 record could not post: it is with the storeman.') : __('{0} records could not post: they are with the storeman.', [held])), indicator: 'orange' }, 10);
+		if (posted || held) return ch_snapshot();
+	});
+	return CH_OFF.flushing;
+}
+
+// Save what this phone's screen shows, for working with no signal.
+function ch_snapshot() {
+	if (!CH_OFF.field || ch_no_signal()) return Promise.resolve();
+	var upto = ch_load('seq', 0);
+	return frappe.call({ method: CH_API + 'snapshot' }).then(function(r) {
+		if (r.message && ch_save('snap', r.message)) {
+			// The new snapshot counts everything posted before it was asked for.
+			ch_save('sent', ch_load('sent', []).filter(function(item) { return item.seq > upto; }));
+		}
+		if (CH_OFF.changed) CH_OFF.changed();
+	}, function(xhr) {
+		ch_lost(xhr);
+	});
+}
+
+function ch_back_online() {
+	ch_signal(true);
+	CH_OFF.stuck = false;
+	return ch_flush().then(ch_snapshot);
+}
+
+// Signal comes and goes: watch for it, and try again every half minute.
+function ch_watch_signal() {
+	if (CH_OFF.watching) return;
+	CH_OFF.watching = true;
+	window.addEventListener('offline', function() { ch_signal(false); });
+	window.addEventListener('online', ch_back_online);
+	setInterval(function() {
+		if (!CH_OFF.signal && navigator.onLine !== false) {
+			// Any answer at all from the server means there is signal again.
+			fetch('/api/method/frappe.auth.get_logged_user', { credentials: 'same-origin', cache: 'no-store' }).then(ch_back_online, function() {});
+		} else if (CH_OFF.signal && ch_queue().length) {
+			CH_OFF.stuck = false;
+			ch_flush();
+		}
+	}, 30000);
+}
+
+// The service worker that opens the desk with no signal, told which files this page
+// loaded so it keeps exactly those.
+function ch_offline_ready() {
+	if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
+	navigator.serviceWorker.register('/nch_sw.js', { scope: '/' }).then(function() {
+		return navigator.serviceWorker.ready;
+	}).then(function(reg) {
+		var assets = {};
+		var mine = location.origin + '/assets/';
+		performance.getEntriesByType('resource').forEach(function(e) { if (e.name.indexOf(mine) === 0) assets[e.name] = true; });
+		$('script[src], link[rel="stylesheet"][href]').each(function() {
+			var url = this.src || this.href;
+			if (url && url.indexOf(mine) === 0) assets[url] = true;
+		});
+		if (reg.active) reg.active.postMessage({ type: 'warm', assets: Object.keys(assets) });
+	}).catch(function(e) {
+		console.warn('Van & Site Stock: working with no signal could not be set up', e);
+	});
+}
+
+// "10:05" today, "Tue 18 Nov 10:05" before.
+function ch_time(value) {
+	var m = moment(value);
+	return m.isValid() ? m.format(m.isSame(moment(), 'day') ? 'HH:mm' : 'ddd D MMM HH:mm') : '';
 }
 
 // The ways stock is handed over, or used straight from a van, and what each needs.
@@ -114,9 +557,12 @@ class ChStock {
 		this.ctx = null;
 		this.basket = [];
 		this.screen = null;
+		// No signal: a strip across the top, above whatever screen is showing.
+		this.$strip = $('<div class="ch-strip" role="status" style="display: none"></div>').appendTo(page.body);
 		this.$root = $('<div class="ch-root"></div>').appendTo(page.body);
 		var $head = page.head ? $(page.head) : $(page.wrapper).find('.page-head');
 		if ($head && $head.length) $head.hide();
+		CH_OFF.changed = () => this.offline_changed();
 		this.load().then(() => this.open_route(), () => this.no_entry());
 	}
 
@@ -124,7 +570,69 @@ class ChStock {
 		return ch_call('bootstrap').then((ctx) => {
 			this.all = ctx;
 			this.set_mode(this.site_mode);
+			// Field phones work with no signal; store work stays online.
+			CH_OFF.field = ctx.kind !== 'store';
+			if (CH_OFF.field) {
+				ch_watch_signal();
+				if (!ch_no_signal()) {
+					ch_offline_ready();
+					ch_flush().then(ch_snapshot);
+				}
+			}
+			this.paint_strip();
 		});
+	}
+
+	// Signal came or went, the queue changed, or a new snapshot was saved.
+	offline_changed() {
+		var snap = ch_load('snap', null);
+		if (this.all && snap && snap.bootstrap) this.all.sorting = snap.bootstrap.sorting || [];
+		this.paint_strip();
+		if (this.screen === 'home') {
+			this.paint_waiting();
+			this.refresh_inbox();
+		}
+	}
+
+	paint_strip() {
+		if (!CH_OFF.field) return;
+		var waiting = ch_queue().length;
+		var off = ch_no_signal();
+		var snap = ch_load('snap', null);
+		var text = '';
+		if (off) text = snap ? __('No signal: showing {0}; what you record is saved on this phone', [ch_time(snap.at)]) : __('No signal, and nothing is saved on this phone yet');
+		else if (waiting) text = __('Sending what was recorded with no signal');
+		if (waiting) text += ' · ' + __('Waiting to send ({0})', [waiting]);
+		this.$strip.toggle(!!text).html(text ? ch_icon(off ? 'wifi-slash' : 'arrows-clockwise') + '<span>' + ch_esc(text) + '</span>' : '');
+	}
+
+	// Home: what is on this phone waiting to send, and what could not post.
+	paint_waiting() {
+		var queue = ch_queue();
+		var sorting = (this.all && this.all.sorting) || [];
+		var parts = [];
+		if (queue.length) {
+			parts.push('<div class="ch-section">' + __('Waiting to send') + '</div>');
+			parts.push('<div class="ch-list">' + queue.map((item) => this.row('disabled', ch_esc(item.summary || item.action), ch_esc(ch_when(item.at)), this.tag(__('On this phone'), 'warn'))).join('\n') + '</div>');
+		}
+		if (sorting.length) {
+			parts.push('<div class="ch-section">' + __('Could not post') + '</div>');
+			parts.push('<div class="ch-list">' + sorting.map((c) => this.row('disabled', ch_esc(c.summary || ''), ch_esc([ch_when(c.recorded_at), c.error].filter(Boolean).join(' · ')), this.tag(__('With the storeman'), 'warn'))).join('\n') + '</div>');
+		}
+		this.$root.find('[data-waiting]').html(parts.join('\n'));
+	}
+
+	// After recording: the usual done screen, or saved on the phone with no signal.
+	wrote(r, online, actions) {
+		if (r && r.queued) {
+			this.done(__('Saved on this phone'), __('It goes by itself when there is signal.'), actions);
+		} else if (r && r.status === 'Needs sorting') {
+			this.done(__('With the storeman'), r.error || '', actions);
+		} else if (r && r.status) {
+			this.done(__('Sent'), '', actions);
+		} else {
+			online(r);
+		}
 	}
 
 	// A driver who also runs sites has two screens: his van (the Van Stock tile) and the
@@ -207,6 +715,7 @@ class ChStock {
 		else if (where === 'stock') this.my_stock();
 		else if (where === 'find') this.find();
 		else if (where === 'recent') this.recent();
+		else if (where === 'sorting') this.sorting_list();
 		else if (where === 'po-request' || where === 'po-approvals') window.location.href = '/' + where;
 		else this.home();
 	}
@@ -406,8 +915,10 @@ class ChStock {
 			'</div>'
 		].join('\n'), 'done');
 		this.$root.find('[data-action]').on('click', function() { actions[+$(this).attr('data-action')].fn(); });
-		// What just happened changes what is waiting; home shows it fresh.
+		// What just happened changes what is waiting; home shows it fresh, and the phone
+		// saves what it now shows for working with no signal.
 		this.refresh_inbox();
+		ch_snapshot();
 	}
 
 	place(name) {
@@ -471,6 +982,8 @@ class ChStock {
 			'  <button class="ch-hero-home" data-desk="1">' + ch_icon('house') + __('Home') + '</button>',
 			'</div>',
 			'<div data-incoming></div>',
+			'<div data-sorting></div>',
+			'<div data-waiting></div>',
 			'<div data-bookings></div>',
 			this.scan_box(__('Scan or type an item to find it')),
 			'<div data-results></div>',
@@ -488,7 +1001,103 @@ class ChStock {
 		this.bind_scan((term) => this.home_scan(term));
 		this.paint_inbox();
 		this.refresh_inbox();
-		if (kind === 'store') this.paint_bookings();
+		this.paint_waiting();
+		if (kind === 'store') {
+			this.paint_sorting();
+			this.paint_bookings();
+		}
+	}
+
+	// Records from field phones that could not post: the storeman sorts them.
+	paint_sorting() {
+		ch_call('needs_sorting').then((list) => {
+			if (this.screen !== 'home') return;
+			var $box = this.$root.find('[data-sorting]');
+			$box.html(list.length ? [
+				'<div class="ch-waiting">',
+				'  <div class="ch-waiting-head">' + ch_icon('warning') + ch_esc(list.length === 1 ? __('1 record needs sorting') : __('{0} records need sorting', [list.length])) + '</div>',
+				'  <div class="ch-list">',
+				this.sorting_rows(list),
+				'  </div>',
+				'</div>'
+			].join('\n') : '');
+			this.bind_sorting($box, list, () => this.home());
+		});
+	}
+
+	sorting_rows(list) {
+		return list.map((c) => this.row(
+			'data-capture="' + ch_esc(c.name) + '"',
+			ch_esc(c.summary || c.action),
+			ch_esc([c.by, ch_when(c.recorded_at)].join(' · ')),
+			this.tag(__('Sort'), 'go')
+		)).join('\n');
+	}
+
+	bind_sorting($box, list, back) {
+		$box.find('[data-capture]').on('click', (e) => {
+			var name = $(e.currentTarget).attr('data-capture');
+			this.sort_one(list.filter(function(c) { return c.name === name; })[0], back);
+		});
+	}
+
+	// The Needs Sorting tile's screen: every record that could not post, nothing else.
+	sorting_list() {
+		this.render([
+			this.head(__('Needs sorting'), __('Recorded with no signal; could not post'), true),
+			'<div data-sorting-list><div class="ch-note">' + __('Loading...') + '</div></div>'
+		].join('\n'), 'sorting-list');
+		this.bind_back(() => this.back_home());
+		ch_call('needs_sorting').then((list) => {
+			if (this.screen !== 'sorting-list') return;
+			var $box = this.$root.find('[data-sorting-list]');
+			if (!list.length) {
+				$box.html('<div class="ch-note">' + __('Nothing needs sorting.') + '</div>');
+				return;
+			}
+			$box.html('<div class="ch-list">' + this.sorting_rows(list) + '</div>');
+			this.bind_sorting($box, list, () => this.sorting_list());
+		});
+	}
+
+	// One record: who recorded what, when, and why it could not post. Try it again once
+	// the stock is right, or drop it with a reason.
+	sort_one(c, back) {
+		this.render([
+			this.head(__('Needs sorting'), c.by, true),
+			'<div class="ch-card">',
+			this.facts([[__('Recorded by'), c.by], [__('When'), ch_when(c.recorded_at) + ' · ' + frappe.datetime.str_to_user(c.recorded_at)], [__('What'), c.summary || c.action]]),
+			c.error ? '<div class="ch-notes">' + ch_esc(c.error) + '</div>' : '',
+			'</div>',
+			'<div class="ch-hint">' + ch_icon('info') + ch_esc(__('Nothing moved. Put the stock right, then try it again; it is dated when it was recorded.')) + '</div>',
+			'<button class="ch-secondary ch-quiet" data-drop="1">' + ch_icon('trash') + __('Drop it') + '</button>',
+			'<div class="ch-actions"><button class="ch-submit" data-retry="1">' + ch_icon('arrow-clockwise') + __('Try it again') + '</button></div>'
+		].join('\n'), 'sort');
+		this.bind_back(back);
+		var after = [
+			{ label: __('Next one'), primary: true, fn: () => this.sorting_list() },
+			{ label: __('Home'), fn: () => this.back_home() }
+		];
+		this.$root.find('[data-retry]').on('click', () => {
+			ch_call('sort_capture', { capture_id: c.name, how: 'retry' }, true).then((r) => {
+				var result = r.result || {};
+				this.done(__('Posted'), [result.stock_entry, result.name].filter(Boolean).join(' · '), after);
+			});
+		});
+		this.$root.find('[data-drop]').on('click', () => {
+			var dialog = new frappe.ui.Dialog({
+				title: __('Drop it'),
+				fields: [{ fieldtype: 'Small Text', fieldname: 'note', label: __('Why is it dropped?'), reqd: 1 }],
+				primary_action_label: __('Drop it'),
+				primary_action: (values) => {
+					dialog.hide();
+					ch_call('sort_capture', { capture_id: c.name, how: 'drop', note: values.note }, true).then(() => {
+						this.done(__('Dropped'), __('Nothing moved'), after);
+					});
+				}
+			});
+			dialog.show();
+		});
 	}
 
 	booking_rows(list) {
@@ -637,11 +1246,12 @@ class ChStock {
 		$sent.html(inbox.sent.length ? [
 			'<div class="ch-section">' + __('Sent, not accepted yet') + '</div>',
 			'<div class="ch-list">',
+			// One recorded with no signal is on the phone until it is sent: nothing to open yet.
 			inbox.sent.map((d) => this.row(
-				'data-docket="' + ch_esc(d.name) + '"',
+				d.name ? 'data-docket="' + ch_esc(d.name) + '"' : 'disabled',
 				ch_esc(__('To {0}', [d.to])),
 				ch_esc(d.preview) + ' · ' + ch_esc(ch_when(d.at)),
-				this.tag(__('Waiting'))
+				this.tag(d.queued ? __('Waiting to send') : __('Waiting'), d.queued ? 'warn' : '')
 			)).join('\n'),
 			'</div>'
 		].join('\n') : '');
@@ -1051,22 +1661,34 @@ class ChStock {
 		}
 		if (how.use) {
 			var kind_used = this.kind;
-			ch_call('use', {
+			var used_actions = [
+				{ label: __('Record more'), primary: true, fn: () => this.send(kind_used) },
+				{ label: __('Home'), fn: () => this.back_home() }
+			];
+			ch_write('use', {
 				store: this.from,
 				site: this.to,
 				notes: this.$root.find('[data-note]').val() || '',
 				rows: JSON.stringify(this.basket.map(function(r) {
 					return { item_code: r.item_code, qty: r.qty, s_warehouse: r.s_warehouse };
 				}))
-			}, true).then((r) => {
-				this.done(__('Used on {0}', [target.label]), r.name + ' · ' + __('costed to {0}', [target.project_name || r.project]), [
-					{ label: __('Record more'), primary: true, fn: () => this.send(kind_used) },
-					{ label: __('Home'), fn: () => this.back_home() }
-				]);
+			}, ch_summary(__('Used from the van on {0}', [target.label]), this.basket), { id: this.docket_id }).then((r) => {
+				this.wrote(r, () => this.done(__('Used on {0}', [target.label]), r.name + ' · ' + __('costed to {0}', [target.project_name || r.project]), used_actions), used_actions);
 			});
 			return;
 		}
-		ch_call('send', {
+		var kind = this.kind;
+		var source = this.place(this.from) || {};
+		// Handing it to yourself goes straight in (field.send): a driver to a site he runs,
+		// a site manager between their own sites.
+		var own = (this.all.mine || []).concat(this.all.managed || []).map(function(p) { return p.name; });
+		var straight = (source.kind === 'van' && (this.all.managed || []).some((p) => p.name === this.to))
+			|| (source.kind === 'site' && target.kind === 'site' && own.indexOf(this.to) !== -1);
+		var sent_actions = [
+			{ label: __('Send more'), primary: true, fn: () => this.send(kind) },
+			{ label: __('Home'), fn: () => this.back_home() }
+		];
+		ch_write('send', {
 			from_location: this.from,
 			to_location: this.to,
 			project: this.project || '',
@@ -1075,15 +1697,13 @@ class ChStock {
 			rows: JSON.stringify(this.basket.map(function(r) {
 				return { item_code: r.item_code, qty: r.qty, s_warehouse: r.s_warehouse };
 			}))
-		}, true).then((r) => {
-			var kind = this.kind;
-			// To a site he runs, a driver's delivery is in at once.
-			var message = r.posted ? __('Booked into {0}', [target.label]) : __('Sent to {0}', [target.label]);
-			var ref = r.posted ? r.stock_entry + ' · ' + r.name : r.name + ' · ' + __('nothing moves until they count it and accept');
-			this.done(message, ref, [
-				{ label: __('Send more'), primary: true, fn: () => this.send(kind) },
-				{ label: __('Home'), fn: () => this.back_home() }
-			]);
+		}, ch_summary(__('To {0}', [target.label]), this.basket), { id: this.docket_id, straight: straight }).then((r) => {
+			this.wrote(r, () => {
+				// To a site he runs, a driver's delivery is in at once.
+				var message = r.posted ? __('Booked into {0}', [target.label]) : __('Sent to {0}', [target.label]);
+				var ref = r.posted ? r.stock_entry + ' · ' + r.name : r.name + ' · ' + __('nothing moves until they count it and accept');
+				this.done(message, ref, sent_actions);
+			}, sent_actions);
 		});
 	}
 
@@ -1091,6 +1711,8 @@ class ChStock {
 
 	review(name) {
 		ch_call('docket', { name: name }).then((d) => {
+			// One id for this count: a second tap on Accept sends the same record.
+			this.capture_id = frappe.utils.get_random(20);
 			this.counted = {};
 			// Into a van, the one part of the van the whole handover goes in. It opens on
 			// Goods In Transit, the usual answer, so the driver only changes it on purpose.
@@ -1214,31 +1836,32 @@ class ChStock {
 	}
 
 	accept(d) {
-		ch_call('accept', {
+		var counted = this.counted;
+		var lines = d.lines.map(function(l) { return { item_code: l.item_code, item_name: l.item_name, qty: flt(counted[l.row]) }; }).filter(function(l) { return l.qty > 0; });
+		var actions = [{ label: __('Home'), primary: true, fn: () => this.back_home() }];
+		ch_write('accept', {
 			name: d.name,
-			counted: JSON.stringify(this.counted),
+			counted: JSON.stringify(counted),
 			put: this.put,
 			notes: this.$root.find('[data-note]').val() || ''
-		}, true).then((r) => {
-			this.done(__('Accepted into {0}', [d.to]), r.stock_entry + ' · ' + d.name, [
-				{ label: __('Home'), primary: true, fn: () => this.back_home() }
-			]);
+		}, ch_summary(__('Accepted from {0}', [d.from]), lines), { id: this.capture_id }).then((r) => {
+			this.wrote(r, () => this.done(__('Accepted into {0}', [d.to]), r.stock_entry + ' · ' + d.name, actions), actions);
 		});
 	}
 
 	reject(d) {
 		// A note already typed on the handover is the reason: never typed twice.
 		var typed = (this.$root.find('[data-note]').val() || '').trim();
+		var id = frappe.utils.get_random(20);
+		var actions = [{ label: __('Home'), primary: true, fn: () => this.back_home() }];
 		var dialog = new frappe.ui.Dialog({
 			title: __('Turn it down'),
 			fields: [{ fieldtype: 'Small Text', fieldname: 'reason', label: __('Why? {0} will see this.', [d.by]), reqd: 1, default: typed }],
 			primary_action_label: __('Turn it down'),
 			primary_action: (values) => {
 				dialog.hide();
-				ch_call('reject', { name: d.name, reason: values.reason }, true).then(() => {
-					this.done(__('Turned down'), d.name + ' · ' + __('nothing moved'), [
-						{ label: __('Home'), primary: true, fn: () => this.back_home() }
-					]);
+				ch_write('reject', { name: d.name, reason: values.reason }, __('Turned down {0} from {1}', [d.name, d.from]), { id: id }).then((r) => {
+					this.wrote(r, () => this.done(__('Turned down'), d.name + ' · ' + __('nothing moved'), actions), actions);
 				});
 			}
 		});
@@ -1336,16 +1959,19 @@ class ChStock {
 			filter = typed;
 			this.filter_held(typed);
 		});
+		// One id for this list: a second tap on Record sends the same record.
+		var id = frappe.utils.get_random(20);
 		this.$root.find('[data-record]').on('click', () => {
-			ch_call('use', {
+			var actions = [
+				{ label: __('More for {0}', [site.label]), primary: true, fn: () => this.use_at(site) },
+				{ label: __('Home'), fn: () => this.back_home() }
+			];
+			ch_write('use', {
 				store: site.name,
 				notes: this.$root.find('[data-note]').val() || '',
 				rows: JSON.stringify(this.basket.map(function(r) { return { item_code: r.item_code, qty: r.qty }; }))
-			}, true).then((r) => {
-				this.done(__('Used on {0}', [site.label]), r.name + ' · ' + __('costed to {0}', [site.project_name || r.project]), [
-					{ label: __('More for {0}', [site.label]), primary: true, fn: () => this.use_at(site) },
-					{ label: __('Home'), fn: () => this.back_home() }
-				]);
+			}, ch_summary(__('Used on {0}', [site.label]), this.basket), { id: id }).then((r) => {
+				this.wrote(r, () => this.done(__('Used on {0}', [site.label]), r.name + ' · ' + __('costed to {0}', [site.project_name || r.project]), actions), actions);
 			});
 		});
 		this.paint_basket(__('Record {0} used'));
@@ -1429,20 +2055,20 @@ class ChStock {
 		].join('\n'), 'delivery');
 		this.bind_back(() => this.deliveries_at(site));
 		this.paint_delivery(o);
+		var id = frappe.utils.get_random(20);
 		this.$root.find('[data-book]').on('click', () => {
 			var counted = this.counted;
-			var rows = o.lines.filter(function(l) { return flt(counted[l.row]) > 0; }).map(function(l) {
-				return { po_detail: l.row, qty: counted[l.row] };
-			});
-			ch_call('receive', {
+			var lines = o.lines.filter(function(l) { return flt(counted[l.row]) > 0; });
+			var actions = [
+				{ label: __('Another delivery'), primary: true, fn: () => this.deliveries_at(site) },
+				{ label: __('Home'), fn: () => this.back_home() }
+			];
+			ch_write('receive', {
 				purchase_order: o.name,
-				rows: JSON.stringify(rows),
+				rows: JSON.stringify(lines.map(function(l) { return { po_detail: l.row, qty: counted[l.row] }; })),
 				delivery_note: this.$root.find('[data-dn]').val() || ''
-			}, true).then((r) => {
-				this.done(__('Booked into {0}', [site.label]), r.name + ' · ' + o.name, [
-					{ label: __('Another delivery'), primary: true, fn: () => this.deliveries_at(site) },
-					{ label: __('Home'), fn: () => this.back_home() }
-				]);
+			}, ch_summary(__('Delivered on {0} by {1}', [site.label, o.supplier]), lines.map(function(l) { return { item_code: l.item_code, item_name: l.item_name, qty: counted[l.row] }; })), { id: id }).then((r) => {
+				this.wrote(r, () => this.done(__('Booked into {0}', [site.label]), r.name + ' · ' + o.name, actions), actions);
 			});
 		});
 	}
@@ -1484,21 +2110,21 @@ class ChStock {
 		].join('\n'), 'delivery');
 		this.bind_back(() => this.collect());
 		this.paint_delivery(o, van.label);
+		var id = frappe.utils.get_random(20);
 		this.$root.find('[data-book]').on('click', () => {
 			var counted = this.counted;
-			var rows = o.lines.filter(function(l) { return flt(counted[l.row]) > 0; }).map(function(l) {
-				return { po_detail: l.row, qty: counted[l.row] };
-			});
-			ch_call('collect', {
+			var lines = o.lines.filter(function(l) { return flt(counted[l.row]) > 0; });
+			var actions = [
+				// Deliver to a site opens on that site, filled with what was collected.
+				{ label: __('Deliver now'), primary: true, fn: () => { ch_remember('to-site:to', o.site); this.send('to-site'); } },
+				{ label: __('Home'), fn: () => this.back_home() }
+			];
+			ch_write('collect', {
 				purchase_order: o.name,
-				rows: JSON.stringify(rows),
+				rows: JSON.stringify(lines.map(function(l) { return { po_detail: l.row, qty: counted[l.row] }; })),
 				delivery_note: this.$root.find('[data-dn]').val() || ''
-			}, true).then((r) => {
-				this.done(__('On {0} for {1}', [van.label, o.site_label]), r.name + ' · ' + o.name, [
-					// Deliver to a site opens on that site, filled with what was collected.
-					{ label: __('Deliver now'), primary: true, fn: () => { ch_remember('to-site:to', r.site); this.send('to-site'); } },
-					{ label: __('Home'), fn: () => this.back_home() }
-				]);
+			}, ch_summary(__('Collected from {0} for {1}', [o.supplier, o.site_label]), lines.map(function(l) { return { item_code: l.item_code, item_name: l.item_name, qty: counted[l.row] }; })), { id: id }).then((r) => {
+				this.wrote(r, () => this.done(__('On {0} for {1}', [van.label, o.site_label]), r.name + ' · ' + o.name, actions), actions);
 			});
 		});
 	}

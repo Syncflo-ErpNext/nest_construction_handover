@@ -968,3 +968,34 @@
 .ch-hero-home .ph {
 	font-size: 18px;
 }
+
+/* No signal: the strip across the top of the field screen. It sits outside .ch-root,
+ * so it carries its own colours; colour is not the only signal, the words say it. */
+.ch-strip {
+	position: sticky;
+	top: var(--navbar-height, 0px);
+	z-index: 20;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	max-width: 640px;
+	margin: 0 auto;
+	padding: 10px 14px;
+	font-size: 15px;
+	font-weight: 600;
+	line-height: 1.35;
+	color: #7c2d12;
+	background: #ffedd5;
+	border-bottom: 2px solid #fb923c;
+}
+
+.ch-strip .ph {
+	flex: none;
+	font-size: 20px;
+}
+
+[data-theme="dark"] .ch-strip {
+	color: #fed7aa;
+	background: #431407;
+	border-bottom-color: #c2410c;
+}
