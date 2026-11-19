@@ -406,13 +406,11 @@ def _summaries(dockets, places):
 	if not dockets:
 		return []
 	labels = _labels(places)
-	# The site a handover is for: where a delivery goes, else the site of the project an
-	# issue to a van was booked for. A return off a site is not for that site.
+	# What a handover is for: the site a delivery goes to, else the project a load onto a
+	# van is for (van stock belongs to a project, not one of its sites). A return off a
+	# site is not for that site.
 	sites = {name: place for name, place in places.items() if place["kind"] == "site"}
-	site_of_project = {}
-	for place in sites.values():
-		if place.get("project"):
-			site_of_project.setdefault(place["project"], place["label"])
+	project_names = {place["project"]: place["project_name"] for place in sites.values() if place.get("project")}
 	lines = {}
 	for row in frappe.get_all(
 		DOCKET_ITEM,
@@ -433,7 +431,7 @@ def _summaries(dockets, places):
 		elif doc.from_warehouse in sites:
 			site = None
 		else:
-			site = site_of_project.get(doc.project)
+			site = project_names.get(doc.project)
 		out.append(
 			{
 				"name": doc.name,
@@ -465,7 +463,6 @@ def docket(name):
 	labels = _labels(me.places)
 	# Into a van the driver puts the whole handover in one part of the van: say which there are.
 	target = me.places.get(doc.to_warehouse) or {}
-	booked_for = frappe.db.get_value("Material Request", doc.material_request, "set_warehouse") if doc.material_request else None
 	return {
 		"name": doc.name,
 		"status": doc.status,
@@ -473,7 +470,6 @@ def docket(name):
 		"to": labels.get(doc.to_warehouse, doc.to_warehouse),
 		"into_van": target.get("kind") == "van",
 		"compartments": list(target.get("compartments") or {}),
-		"booked_for": labels.get(booked_for, booked_for) if booked_for else None,
 		"project": doc.project,
 		"project_name": frappe.db.get_value("Project", doc.project, "project_name") if doc.project else None,
 		"by": get_fullname(doc.given_by),
@@ -512,24 +508,25 @@ def held(location):
 
 @frappe.whitelist()
 def due(van):
-	"""What is on my van for each site and not yet handed over there: site -> lines.
+	"""What is on my van for each project and not yet handed over at its sites:
+	project -> lines.
 
-	What the van accepted on handovers for a project or collected from a supplier for
-	one, less what has left the van on
-	handovers for that project (an open one carries what was sent, an accepted one
-	what was counted in, so a short count stays due), and never more than is free in
-	that part of the van now. Deliver to a site starts from this list.
+	Van stock belongs to a project, not to one of its sites: the storeman loads per
+	project and the driver says which site at delivery, so one load serves every site
+	of a project. What the van accepted on handovers for a project or collected from a
+	supplier for one, less what has left the van on handovers for that project (an
+	open one carries what was sent, an accepted one what was counted in, so a short
+	count stays due), and never more than is free in that part of the van now. Deliver
+	to a site starts from this list.
 	"""
 	me = _me()
 	place = me.places.get(van)
 	if van not in me.mine or not place or place["kind"] != "van":
 		frappe.throw(_("Only the driver of {0} sees what is due off it.").format(van), frappe.PermissionError)
 	parts = list((place.get("compartments") or {}).values())
-	site_of = {}
-	for name, site in me.places.items():
-		if site["kind"] == "site" and site.get("project"):
-			site_of.setdefault(site["project"], name)
-	if not parts or not site_of:
+	# Only projects with a site to deliver to.
+	projects = {site["project"] for site in me.places.values() if site["kind"] == "site" and site.get("project")}
+	if not parts or not projects:
 		return {}
 
 	values = {"van": van, "parts": tuple(parts)}
@@ -584,13 +581,12 @@ def due(van):
 
 	out = {}
 	for (project, item_code, warehouse), qty in sorted(came.items()):
-		site = site_of.get(project)
 		here = held.get((item_code, warehouse))
-		if not site or not here or here["tracked"]:
+		if project not in projects or not here or here["tracked"]:
 			continue
 		qty = min(qty - gone.get((project, item_code, warehouse), 0), here["free"])
 		if qty > EPSILON:
-			out.setdefault(site, []).append(
+			out.setdefault(project, []).append(
 				{
 					"item_code": item_code,
 					"item_name": here["item_name"],
@@ -1095,7 +1091,7 @@ def _lines_to_go(me, names=None):
 
 
 def _bookings(me, names=None):
-	"""Bookings from my store to a site with something still to issue, newest first."""
+	"""Bookings from my store to a project with something still to issue, newest first."""
 	out = {}
 	for line in _lines_to_go(me, names):
 		booking = out.get(line.booking)
@@ -1104,7 +1100,6 @@ def _bookings(me, names=None):
 			booking = out[line.booking] = {
 				"name": line.booking,
 				"from": line.set_from_warehouse,
-				"site": site["label"],
 				"project": site.get("project"),
 				"project_name": site.get("project_name"),
 				"by": get_fullname(line.owner),
@@ -1252,19 +1247,28 @@ def site_counts():
 
 
 @frappe.whitelist()
-def book(store, site, rows):
-	"""Book stock in the store to a site: the list is captured once and kept as a
-	Material Request. Nothing moves until it is issued to a van and accepted."""
+def book(store, project, rows):
+	"""Book stock in the store to a project: the list is captured once and kept as a
+	Material Request. Nothing moves until it is issued to a van and accepted.
+
+	The storeman books per project; the driver says which of its sites at delivery.
+	A Material Request still needs a destination, so it names one of the project's
+	site stores. Nothing reads that as the site the stock is for."""
 	me = _me()
 	if store not in me.mine or me.places[store]["kind"] != "store":
-		frappe.throw(_("Only the main store books stock to a site."), frappe.PermissionError)
-	place = me.places.get(site)
-	if not place or place["kind"] != "site":
-		frappe.throw(_("Choose the site the stock is for."))
-	if not place.get("project"):
-		frappe.throw(_("{0} is not on an open project.").format(place["label"]))
-	if place["company"] != me.places[store]["company"]:
-		frappe.throw(_("{0} and {1} belong to different companies.").format(me.places[store]["label"], place["label"]))
+		frappe.throw(_("Only the main store books stock to a project."), frappe.PermissionError)
+	company = me.places[store]["company"]
+	site = next(
+		(
+			name
+			for name, place in me.places.items()
+			if place["kind"] == "site" and project and place.get("project") == project and place["company"] == company
+		),
+		None,
+	)
+	if not site:
+		frappe.throw(_("Choose an open project of {0} that has a site.").format(company))
+	place = me.places[site]
 
 	rows = _rows(rows)
 	items = _usable([row["item_code"] for row in rows])
