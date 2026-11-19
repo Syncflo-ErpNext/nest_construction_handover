@@ -1025,8 +1025,9 @@ class ChStock {
 	review(name) {
 		ch_call('docket', { name: name }).then((d) => {
 			this.counted = {};
-			// Into a van, the one part of the van the whole handover goes in.
-			this.put = '';
+			// Into a van, the one part of the van the whole handover goes in. It opens on
+			// Goods In Transit, the usual answer, so the driver only changes it on purpose.
+			this.put = d.into_van && (d.compartments || []).indexOf('Goods In Transit') !== -1 ? 'Goods In Transit' : '';
 			// Counting a handover is work in progress (see busy()); looking at one is not.
 			this.counting = !!d.can_accept;
 			d.lines.forEach((l) => { this.counted[l.row] = l.sent; });
@@ -1062,7 +1063,7 @@ class ChStock {
 				'<label class="ch-label">' + __('Put it all in'),
 				'  <select class="ch-select" data-put-all="1">',
 				'    <option value="">' + __('Choose a part of the van') + '</option>',
-				this.van_parts(d).map(function(c) { return '<option value="' + ch_esc(c) + '">' + ch_esc(c) + '</option>'; }).join('\n'),
+				this.van_parts(d).map((c) => '<option value="' + ch_esc(c) + '"' + (c === this.put ? ' selected' : '') + '>' + ch_esc(c) + '</option>').join('\n'),
 				'  </select>',
 				'</label>'
 			].join('\n') : '',
