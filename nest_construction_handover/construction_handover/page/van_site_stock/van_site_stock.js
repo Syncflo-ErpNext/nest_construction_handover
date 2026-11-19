@@ -42,6 +42,8 @@ var CH_API = 'nest_construction_handover.field.';
 
 // Shared with the Stock Locations page: public/js/nch_stock.bundle.js (app_include_js).
 var CH_COMPARTMENTS = nch_stock.COMPARTMENTS;
+// The parts of a van a breakdown can be fitted from (Used from the van): never tools or assets.
+var CH_USABLE = ['Goods In Transit', 'Van Stock'];
 var ch_esc = nch_stock.esc;
 var ch_qty = nch_stock.qty;
 var ch_amount = nch_stock.amount;
@@ -90,13 +92,19 @@ function ch_call(method, args, freeze) {
 	}).then(function(r) { return r.message; });
 }
 
-// The four ways stock is handed over, and what each needs.
+// The ways stock is handed over, or used straight from a van, and what each needs.
 var CH_SENDS = {
 	'book': { title: __('Book stock to a project'), to: 'sites', book: true },
 	'to-van': { title: __('Send to a van'), to: 'vans', into_van: true, project: true },
 	'to-site': { title: __('Deliver to a site'), to: 'sites', out_of_van: true },
 	'to-store': { title: __('Back to the store'), to: 'stores', out_of_van: true },
-	'site-to-van': { title: __('Back on a van'), to: 'vans', into_van: true }
+	'site-to-van': { title: __('Back on a van'), to: 'vans', into_van: true },
+	// Only to another site on the same project: another project is a different job.
+	'site-to-site': { title: __('To another site'), to: 'sites', same_project: true },
+	// Van stock belongs to a project: the load keeps it.
+	'van-to-van': { title: __('To another van'), to: 'vans', into_van: true, out_of_van: true, project: true },
+	// A breakdown: fitted straight from the van to a site of a project, which costs it.
+	'van-used': { title: __('Used from the van'), to: 'sites', out_of_van: true, use: true }
 };
 
 class ChStock {
@@ -171,7 +179,8 @@ class ChStock {
 	}
 
 	// van-site-stock/book, /issue, /send-van, /deliver, /return-store, /return-van, /used,
-	// /receive, /stock, /find, /recent opens that screen (desk tiles link here).
+	// /site-to-site, /van-to-van, /used-van, /receive, /stock, /find, /recent opens that
+	// screen (desk tiles link here).
 	open_route() {
 		var sub = (frappe.get_route() || [])[1];
 		this.set_mode(sub === 'sites');
@@ -189,6 +198,9 @@ class ChStock {
 		else if (where === 'deliver') this.send('to-site');
 		else if (where === 'return-store') this.send('to-store');
 		else if (where === 'return-van') this.send('site-to-van');
+		else if (where === 'site-to-site') this.send('site-to-site');
+		else if (where === 'van-to-van') this.send('van-to-van');
+		else if (where === 'used-van') this.send('van-used');
 		else if (where === 'used') this.use();
 		else if (where === 'receive') this.receive();
 		else if (where === 'collect') this.collect();
@@ -433,11 +445,14 @@ class ChStock {
 			tiles.push(this.tile('deliver', 'map-pin', __('Deliver to a site'), __('Hand stock over at a site')));
 			tiles.push(this.tile('collect', 'storefront', __('Collect from supplier'), __('Book a site order into your van')));
 			tiles.push(this.tile('used', 'wrench', __('Used on site'), __('Record what was fitted; it costs the job')));
+			tiles.push(this.tile('used-van', 'toolbox', __('Used from the van'), __('Fitted straight from the van; it costs the job')));
+			if ((ctx.vans || []).length > 1) tiles.push(this.tile('van-to-van', 'arrows-left-right', __('To another van'), __('Hand stock to another driver')));
 			tiles.push(this.tile('return-store', 'arrow-u-down-left', __('Back to the store'), __('Return what is not needed')));
 			tiles.push(this.tile('stock', 'package', __('My van'), __('What is in each part of the van')));
 		} else {
 			tiles.push(this.tile('used', 'wrench', __('Used on site'), __('Record what was fitted; it costs the job')));
 			tiles.push(this.tile('return-van', 'truck', __('Back on a van'), __('Send stock off site')));
+			if (this.paired_sites().length) tiles.push(this.tile('site-to-site', 'arrows-left-right', __('To another site'), __('Move stock to another site on the project')));
 			tiles.push(this.tile('stock', 'package', __('On site now'), __('What is in the site store')));
 		}
 		if (kind !== 'store' && (ctx.receive_at || []).length) {
@@ -672,39 +687,55 @@ class ChStock {
 		this.docket_id = frappe.utils.get_random(20);
 		this.project = '';
 
-		var mine_names = ctx.mine.map(function(p) { return p.name; });
+		var mine_names = this.sources(how).map(function(p) { return p.name; });
 		var kept_from = ch_remembered(kind + ':from');
 		// A manager with several sites chooses the site each time: From opens empty.
 		var several = mine_names.length > 1 && this.ctx.kind === 'site';
-		this.from = several ? '' : (mine_names.indexOf(kept_from) !== -1 ? kept_from : mine_names[0]);
+		this.from = several ? '' : (mine_names.indexOf(kept_from) !== -1 ? kept_from : (mine_names[0] || ''));
 
 		var targets = this.targets(how);
 		// Booking: the storeman always chooses the site, never last time's.
 		var kept_to = how.book ? '' : ch_remembered(kind + ':to');
 		this.to = targets.some(function(p) { return p.name === kept_to; }) ? kept_to : (targets.length === 1 ? targets[0].name : '');
 		// A site is picked project first (site_fields): start on the chosen site's project.
-		this.to_project = how.to === 'sites' ? ((this.place(this.to) || {}).project || this.to) : '';
+		this.to_project = how.to === 'sites' && !how.same_project ? ((this.place(this.to) || {}).project || this.to) : '';
 
 		this.paint_send(how);
-		if (kind === 'to-site' && (this.place(this.from) || {}).kind === 'van') this.load_due(how);
+		if ((kind === 'to-site' || kind === 'van-to-van') && (this.place(this.from) || {}).kind === 'van') this.load_due(how);
+	}
+
+	// Where a handover can come from: my own places; to another site, only my sites
+	// that share their project with another site.
+	sources(how) {
+		return how.same_project ? this.paired_sites() : this.ctx.mine;
+	}
+
+	paired_sites() {
+		var sites = this.ctx.sites || [];
+		return (this.ctx.mine || []).filter(function(s) {
+			return s.project && sites.some(function(o) { return o.project === s.project && o.name !== s.name; });
+		});
 	}
 
 	// Deliver to a site starts from what the van holds for each project: a project with
 	// stock due is chosen and its lines are already on the list, in full. The driver
-	// says which of its sites, then takes off what is not for this one.
+	// says which of its sites, then takes off what is not for this one. To another van,
+	// the projects with stock on the van come first and choosing one fills the list.
 	load_due(how) {
 		var kind = this.kind;
 		ch_call('due', { van: this.from }).then((due) => {
 			if (this.kind !== kind || this.screen !== 'send') return;
 			this.due = due || {};
-			if (!this.due[this.to_project]) {
-				var first = ch_projects(this.targets(how)).filter((p) => this.due[p.name])[0];
-				if (first) {
-					this.to_project = first.name;
-					this.to = '';
+			if (how.to === 'sites') {
+				if (!this.due[this.to_project]) {
+					var first = ch_projects(this.targets(how)).filter((p) => this.due[p.name])[0];
+					if (first) {
+						this.to_project = first.name;
+						this.to = '';
+					}
 				}
+				if (!this.basket.length) this.basket = this.due_lines(this.to_project);
 			}
-			if (!this.basket.length) this.basket = this.due_lines(this.to_project);
 			this.paint_send(how);
 		});
 	}
@@ -741,25 +772,36 @@ class ChStock {
 	targets(how) {
 		var from = this.place(this.from);
 		var company = from && from.company;
-		return (this.ctx[how.to] || []).filter((p) => p.name !== this.from && (!company || !p.company || p.company === company) && (!how.book || p.project));
+		return (this.ctx[how.to] || []).filter((p) => p.name !== this.from && (!company || !p.company || p.company === company)
+			&& (!(how.book || how.use) || p.project)
+			&& (!how.same_project || !!(from && p.project && p.project === from.project)));
+	}
+
+	// What a load onto a van can be for: the storeman's open projects; from a van the
+	// projects with sites, those with stock on the van first.
+	load_projects() {
+		if (this.ctx.kind === 'store') return this.ctx.projects || [];
+		var projects = ch_projects((this.ctx.sites || []).filter(function(s) { return s.project; }));
+		return this.due ? this.due_first(projects) : projects;
 	}
 
 	paint_send(how) {
-		var ctx = this.ctx;
 		var source = this.place(this.from);
 		var targets = this.targets(how);
-		var projects = how.project ? (ctx.projects || []) : [];
+		var projects = how.project ? this.load_projects() : [];
 
 		this.render([
 			this.head(how.title, source ? __('From {0}', [source.label]) : '', true),
 			'<div class="ch-pair">',
-			this.place_field('from', __('From'), ch_by_label(ctx.mine), this.from, __('Choose where from')),
-			how.to === 'sites' ? this.site_fields(how, targets) : this.place_field('to', __('To'), ch_by_label(targets), this.to, __('Choose where to')),
+			this.place_field('from', __('From'), ch_by_label(this.sources(how)), this.from, __('Choose where from')),
+			how.to === 'sites' && !how.same_project
+				? this.site_fields(how, targets)
+				: this.place_field('to', how.same_project ? __('Which site?') : __('To'), ch_by_label(targets), this.to, how.same_project ? __('Choose the site') : __('Choose where to')),
 			projects.length ? [
 				'<label class="ch-label">' + __('For a project? (optional)'),
 				'  <select class="ch-select" data-project="1">',
 				'    <option value="">' + __('No: van stock') + '</option>',
-				projects.map((p) => '<option value="' + ch_esc(p.name) + '"' + (p.name === this.project ? ' selected' : '') + '>' + ch_esc(p.project_name || p.name) + '</option>').join('\n'),
+				projects.map((p) => '<option value="' + ch_esc(p.name) + '"' + (p.name === this.project ? ' selected' : '') + '>' + ch_esc(p.label || p.project_name || p.name) + '</option>').join('\n'),
 				'  </select>',
 				'</label>'
 			].join('\n') : '',
@@ -784,6 +826,8 @@ class ChStock {
 				// Different shelves: start the list again.
 				this.basket = [];
 				if (!this.targets(how).some((p) => p.name === this.to)) this.to = '';
+				// To another site: one other site on the project fills in by itself.
+				if (how.same_project && !this.to && this.targets(how).length === 1) this.to = this.targets(how)[0].name;
 				if (!ch_projects(this.targets(how)).some((p) => p.name === this.to_project)) this.to_project = '';
 				var reload = !!this.due;
 				this.due = null;
@@ -802,6 +846,8 @@ class ChStock {
 		});
 		this.$root.find('[data-project]').on('change', (e) => {
 			this.project = $(e.currentTarget).val();
+			// From a van: that project's stock on it fills the list.
+			if (this.due) this.basket = this.due_lines(this.project);
 			this.paint_route_note(how);
 			this.paint_basket();
 		});
@@ -814,7 +860,7 @@ class ChStock {
 		});
 		this.$root.find('[data-record]').on('click', () => this.record_send(how));
 		this.paint_route_note(how);
-		this.paint_basket(how.book ? __('Book {0}') : __('Send {0}'));
+		this.paint_basket(how.book ? __('Book {0}') : (how.use ? __('Record {0} used') : __('Send {0}')));
 	}
 
 	paint_route_note(how) {
@@ -824,6 +870,8 @@ class ChStock {
 			note = __('Booked stock stays in the store until it is issued to a van.');
 		} else if (how.into_van && target) {
 			note = __('The driver chooses which part of {0} each item goes in.', [target.label]);
+		} else if (how.use) {
+			note = __('It costs the project as soon as you record it.');
 		}
 		this.$root.find('[data-route-note]').html(note ? '<div class="ch-hint">' + ch_icon('info') + ch_esc(note) + '</div>' : '');
 	}
@@ -834,6 +882,8 @@ class ChStock {
 		$box.html('<div class="ch-note">' + __('Loading what is here...') + '</div>');
 		ch_call('held', { location: location }).then((rows) => {
 			this.held_rows = rows || [];
+			// Used from the van: only what a job can use up, never tools or assets.
+			if (how && how.use) this.held_rows = this.held_rows.filter((r) => CH_USABLE.indexOf(this.compartment(r.warehouse)) !== -1);
 			if (!this.held_rows.length) {
 				$box.html('<div class="ch-note">' + __('Nothing here at the moment.') + '</div>');
 				return;
@@ -894,7 +944,7 @@ class ChStock {
 
 		// Leaving a van: which compartment. Anywhere else: the place itself.
 		var sources = how.out_of_van
-			? CH_COMPARTMENTS.map((cat) => {
+			? (how.use ? CH_USABLE : CH_COMPARTMENTS).map((cat) => {
 				var wh = (this.place(this.from).compartments || {})[cat];
 				return wh ? { value: wh, cat: cat, free: this.free_in(item.item_code, wh, held) } : null;
 			}).filter(function(s) { return s && s.free > 0; })
@@ -994,6 +1044,23 @@ class ChStock {
 			}, true).then((r) => {
 				this.done(__('Booked for {0}', [project ? project.label : this.to_project]), r.name + ' · ' + __('it stays in the store until it is issued to a van'), [
 					{ label: __('Book more'), primary: true, fn: () => this.send('book') },
+					{ label: __('Home'), fn: () => this.back_home() }
+				]);
+			});
+			return;
+		}
+		if (how.use) {
+			var kind_used = this.kind;
+			ch_call('use', {
+				store: this.from,
+				site: this.to,
+				notes: this.$root.find('[data-note]').val() || '',
+				rows: JSON.stringify(this.basket.map(function(r) {
+					return { item_code: r.item_code, qty: r.qty, s_warehouse: r.s_warehouse };
+				}))
+			}, true).then((r) => {
+				this.done(__('Used on {0}', [target.label]), r.name + ' · ' + __('costed to {0}', [target.project_name || r.project]), [
+					{ label: __('Record more'), primary: true, fn: () => this.send(kind_used) },
 					{ label: __('Home'), fn: () => this.back_home() }
 				]);
 			});
@@ -1160,9 +1227,11 @@ class ChStock {
 	}
 
 	reject(d) {
+		// A note already typed on the handover is the reason: never typed twice.
+		var typed = (this.$root.find('[data-note]').val() || '').trim();
 		var dialog = new frappe.ui.Dialog({
 			title: __('Turn it down'),
-			fields: [{ fieldtype: 'Small Text', fieldname: 'reason', label: __('Why? {0} will see this.', [d.by]), reqd: 1 }],
+			fields: [{ fieldtype: 'Small Text', fieldname: 'reason', label: __('Why? {0} will see this.', [d.by]), reqd: 1, default: typed }],
 			primary_action_label: __('Turn it down'),
 			primary_action: (values) => {
 				dialog.hide();

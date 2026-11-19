@@ -35,6 +35,8 @@ DOCKET_ITEM = "Stock Handover Docket Item"
 # The driver chooses the one compartment a whole handover goes into when accepting.
 
 KINDS = {"Main Store": "store", "Van": "van", "Site Store": "site"}
+# The parts of a van a breakdown can be fitted from (Used from the van).
+USABLE_FROM_VAN = ("Goods In Transit", "Van Stock")
 OFFICE_ROLES = {"Stock Manager", "System Manager"}
 PURCHASING_ROLES = {"PO Requester", "Purchase Site Manager", "Purchase Approver", "Purchase Director"}
 
@@ -516,8 +518,8 @@ def due(van):
 	of a project. What the van accepted on handovers for a project or collected from a
 	supplier for one, less what has left the van on handovers for that project (an
 	open one carries what was sent, an accepted one what was counted in, so a short
-	count stays due), and never more than is free in that part of the van now. Deliver
-	to a site starts from this list.
+	count stays due) or was fitted from it for that project, and never more than is
+	free in that part of the van now. Deliver to a site starts from this list.
 	"""
 	me = _me()
 	place = me.places.get(van)
@@ -577,6 +579,21 @@ def due(van):
 			as_dict=True,
 		)
 	}
+	# Fitted straight from the van on a breakdown (Used from the van): issued against the project.
+	for row in frappe.db.sql(
+		"""
+		select i.project, i.item_code, i.s_warehouse as warehouse, sum(i.transfer_qty) as qty
+		from `tabStock Entry Detail` i
+		inner join `tabStock Entry` e on e.name = i.parent
+		where e.docstatus = 1 and e.purpose = 'Material Issue' and ifnull(i.project, '') != ''
+			and i.s_warehouse in %(parts)s
+		group by i.project, i.item_code, i.s_warehouse
+		""",
+		values,
+		as_dict=True,
+	):
+		key = (row.project, row.item_code, row.warehouse)
+		gone[key] = gone.get(key, 0) + flt(row.qty)
 	held = {(row["item_code"], row["warehouse"]): row for row in _held(parts, _labels(me.places))}
 
 	out = {}
@@ -974,6 +991,11 @@ def send(from_location, to_location, rows, project=None, notes=None, docket_id=N
 		frappe.throw(_("From and to are the same place."))
 	if source["company"] != target["company"]:
 		frappe.throw(_("{0} and {1} belong to different companies.").format(source["label"], target["label"]))
+	# Site to site only within one project: another project is a different job, not a handover.
+	if source["kind"] == "site" and target["kind"] == "site" and (
+		not source.get("project") or source.get("project") != target.get("project")
+	):
+		frappe.throw(_("{0} and {1} are not on the same project.").format(source["label"], target["label"]))
 
 	if project and target["kind"] == "van":
 		job = frappe.db.get_value("Project", project, ["status", "company"], as_dict=True)
@@ -1012,6 +1034,11 @@ def send(from_location, to_location, rows, project=None, notes=None, docket_id=N
 			}
 		)
 
+	if source["kind"] == "van" and target["kind"] == "van":
+		_check_van_load(from_location, project, lines, items, places)
+	# Site to site stays on the one project: say so on the record.
+	if source["kind"] == "site" and target["kind"] == "site":
+		project = source["project"]
 	_check_free(lines, _labels(places), items)
 
 	doc = frappe.new_doc(DOCKET)
@@ -1028,12 +1055,51 @@ def send(from_location, to_location, rows, project=None, notes=None, docket_id=N
 		doc.append("items", line)
 	doc.insert()
 
-	# A driver delivering to a site he runs is handing it to himself: it goes straight
-	# into the site store, with nobody else to count it.
-	if source["kind"] == "van" and from_location in me.mine and to_location in me.managed:
+	# Handing it to yourself goes straight in, with nobody else to count it: a driver
+	# delivering to a site he runs, or a site manager moving stock between their own sites.
+	to_own_site = to_location in me.mine or to_location in me.managed
+	if (source["kind"] == "van" and from_location in me.mine and to_location in me.managed) or (
+		source["kind"] == "site" and target["kind"] == "site" and to_own_site
+	):
 		posted = accept(doc.name)
 		return {"name": doc.name, "stock_entry": posted["stock_entry"], "posted": 1}
 	return {"name": doc.name}
+
+
+def _check_van_load(van, project, lines, items, places):
+	"""Van to van: van stock belongs to a project and the load keeps it. A load for a
+	project carries only that project's stock on the van; one with no project only the
+	van's own stock, which no project has a claim on."""
+	due_by_project = due(van)
+	allowed = {}
+	if project:
+		for row in due_by_project.get(project, []):
+			key = (row["item_code"], row["s_warehouse"])
+			allowed[key] = allowed.get(key, 0) + flt(row["qty"])
+	else:
+		parts = list((places[van].get("compartments") or {}).values())
+		for row in _held(parts, _labels(places)):
+			key = (row["item_code"], row["warehouse"])
+			allowed[key] = allowed.get(key, 0) + flt(row["free"])
+		for rows in due_by_project.values():
+			for row in rows:
+				key = (row["item_code"], row["s_warehouse"])
+				allowed[key] = allowed.get(key, 0) - flt(row["qty"])
+
+	wanted = {}
+	for line in lines:
+		key = (line["item_code"], line["s_warehouse"])
+		wanted[key] = wanted.get(key, 0) + flt(line["qty_sent"])
+	whose = frappe.db.get_value("Project", project, "project_name") or project if project else _("plain van stock")
+	for (code, warehouse), qty in wanted.items():
+		have = max(allowed.get((code, warehouse), 0), 0)
+		if qty > have + EPSILON:
+			uom = items[code].stock_uom if code in items else ""
+			frappe.throw(
+				_("Only {0} of {1} on the van is {2}, not {3}. Stock for another project goes on its own load.").format(
+					_amount(have, uom), code, whose, _qty(qty)
+				)
+			)
 
 
 # ---- bookings: stock booked to a site, then issued to a van -------------------
@@ -1784,33 +1850,53 @@ def collect(purchase_order, rows, delivery_note=None):
 
 
 @frappe.whitelist()
-def use(store, rows, notes=None):
-	"""What was used on site: issued from the site store against its project, which costs it."""
+def use(store, rows, notes=None, site=None):
+	"""What was used on a job: issued against its project, which costs it. From the site
+	store, or on a breakdown straight from the driver's own van, with `site` saying which
+	site of which project it was fitted on."""
 	me = _me()
 	place = me.places.get(store)
-	if not place or place["kind"] != "site":
-		frappe.throw(_("Choose the site the goods were used on."))
-	# A driver who runs sites records only on those; other drivers on any site.
-	any_site = me.kind == "van" and not me.managed
-	if store not in me.mine and store not in me.managed and not any_site and not me.office:
-		frappe.throw(_("You can only record what was used on your own sites."), frappe.PermissionError)
-	project = place.get("project")
+	if place and place["kind"] == "van":
+		if store not in me.mine:
+			frappe.throw(_("You can only record what was used from your own van."), frappe.PermissionError)
+		job = me.places.get(site)
+		if not job or job["kind"] != "site" or job["company"] != place["company"]:
+			frappe.throw(_("Choose the site it was fitted on."))
+		rows = _rows(rows)
+		# Stock for jobs only: tools and assets are not used up.
+		parts = {(place.get("compartments") or {}).get(cat) for cat in USABLE_FROM_VAN} - {None}
+		for row in rows:
+			if row.get("s_warehouse") not in parts:
+				frappe.throw(
+					_("{0}: only Goods In Transit and Van Stock can be used from the van.").format(row["item_code"])
+				)
+		lines = [{"item_code": row["item_code"], "qty": flt(row["qty"]), "s_warehouse": row["s_warehouse"]} for row in rows]
+		said = _("Used from {0} on {1}, recorded by {2}").format(place["label"], job["label"], me.full_name)
+	else:
+		if not place or place["kind"] != "site":
+			frappe.throw(_("Choose the site the goods were used on."))
+		# A driver who runs sites records only on those; other drivers on any site.
+		any_site = me.kind == "van" and not me.managed
+		if store not in me.mine and store not in me.managed and not any_site and not me.office:
+			frappe.throw(_("You can only record what was used on your own sites."), frappe.PermissionError)
+		job = place
+		rows = _rows(rows)
+		lines = [{"item_code": row["item_code"], "qty": flt(row["qty"]), "s_warehouse": store} for row in rows]
+		said = _("Used on {0}, recorded by {1}").format(place["label"], me.full_name)
+	project = job.get("project")
 	if not project:
-		frappe.throw(_("{0} is not on an open project, so there is nothing to cost it to.").format(place["label"]))
+		frappe.throw(_("{0} is not on an open project, so there is nothing to cost it to.").format(job["label"]))
 
-	rows = _rows(rows)
 	items = _usable([row["item_code"] for row in rows])
-	lines = [{"item_code": row["item_code"], "qty": flt(row["qty"]), "s_warehouse": store} for row in rows]
 	_check_free(lines, _labels(me.places), items)
 
 	entry = frappe.new_doc("Stock Entry")
 	entry.stock_entry_type = "Material Issue"
 	entry.company = place["company"]
 	entry.project = project
-	entry.from_warehouse = store
-	entry.remarks = "\n".join(
-		filter(None, [_("Used on {0}, recorded by {1}").format(place["label"], me.full_name), (notes or "").strip()])
-	)
+	if place["kind"] == "site":
+		entry.from_warehouse = store
+	entry.remarks = "\n".join(filter(None, [said, (notes or "").strip()]))
 	# Materials used on a job are a cost of the job: the company's Cost of Goods Sold
 	# account, not Stock Adjustment (which is for stock-count differences).
 	expense_account = frappe.get_cached_value("Company", place["company"], "default_expense_account")
