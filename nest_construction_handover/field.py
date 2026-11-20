@@ -1310,6 +1310,15 @@ def issue_counts():
 
 
 @frappe.whitelist()
+def return_counts():
+	"""Take Returns tile: handovers off the vans waiting for the store to count and accept (red)."""
+	me = _whoami()
+	if not me or me.kind != "store":
+		return _two_counts(0, 0)
+	return _two_counts(_open_handovers("to_warehouse", me.mine), 0)
+
+
+@frappe.whitelist()
 def van_counts():
 	"""Van Stock tile: handovers to accept into the van (red), sent off it and not yet
 	accepted at the other end (orange)."""

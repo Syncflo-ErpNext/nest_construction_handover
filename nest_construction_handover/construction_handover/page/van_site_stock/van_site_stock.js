@@ -716,6 +716,7 @@ class ChStock {
 		else if (where === 'find') this.find();
 		else if (where === 'recent') this.recent();
 		else if (where === 'sorting') this.sorting_list();
+		else if (where === 'returns') this.returns_list();
 		else if (where === 'po-request' || where === 'po-approvals') window.location.href = '/' + where;
 		else this.home();
 	}
@@ -1006,6 +1007,31 @@ class ChStock {
 			this.paint_sorting();
 			this.paint_bookings();
 		}
+	}
+
+	// The Take Returns tile's screen: handovers off the vans waiting to be counted into the store.
+	returns_list() {
+		this.render([
+			this.head(__('Take returns'), __('Stock coming back off the vans'), true),
+			'<div data-returns><div class="ch-note">' + __('Loading...') + '</div></div>'
+		].join('\n'), 'returns-list');
+		this.bind_back(() => this.back_home());
+		ch_call('inbox').then((inbox) => {
+			if (this.screen !== 'returns-list') return;
+			var list = (inbox && inbox.incoming) || [];
+			var $box = this.$root.find('[data-returns]');
+			if (!list.length) {
+				$box.html('<div class="ch-note">' + __('Nothing is waiting to come back in.') + '</div>');
+				return;
+			}
+			$box.html('<div class="ch-list">' + list.map((d) => this.row(
+				'data-docket="' + ch_esc(d.name) + '"',
+				ch_esc(__('From {0}', [d.from])),
+				ch_esc([d.preview, d.by, ch_when(d.at)].filter(Boolean).join(' · ')),
+				this.tag(__('Count'), 'go')
+			)).join('\n') + '</div>');
+			$box.find('[data-docket]').on('click', (e) => this.review($(e.currentTarget).attr('data-docket')));
+		});
 	}
 
 	// Records from field phones that could not post: the storeman sorts them.
@@ -1420,7 +1446,7 @@ class ChStock {
 			this.scan_box(__('Scan or type an item')),
 			'<div data-results></div>',
 			// What is going first, in its own colour; what else is here, to add from, below it.
-			'<div class="ch-section">' + __('Going') + '</div>',
+			'<div class="ch-section">' + (how.use ? __('Used') : __('Going')) + '</div>',
 			'<div class="ch-list" data-basket></div>',
 			'<div data-held></div>',
 			how.book ? '' : '<label class="ch-label">' + __('Note (optional)') + '<input class="ch-text" data-note="1" autocomplete="off"></label>',
@@ -1578,7 +1604,9 @@ class ChStock {
 			default: from_store ? (Math.min(1, sources[0].free) || sources[0].free) : sources[0].free,
 			max: free_of,
 			max_text: function(values) { return __('Only {0} free there.', [ch_amount(free_of(values), uom)]); },
-			info: ch_esc(sources.length === 1 ? __('{0} free to send.', [ch_amount(sources[0].free, uom)]) : __('In more than one part of the van.')),
+			info: ch_esc(sources.length === 1
+				? (how.use ? __('{0} on the van.', [ch_amount(sources[0].free, uom)]) : __('{0} free to send.', [ch_amount(sources[0].free, uom)]))
+				: __('In more than one part of the van.')),
 			take: sources.length > 1 ? sources.map(function(s) { return { value: s.value, label: s.cat + ' · ' + ch_amount(s.free, uom) }; }) : null,
 			take_default: sources[0].value
 		}, (qty, values) => {
@@ -1630,11 +1658,13 @@ class ChStock {
 		if (!r) return;
 		var held = (this.held_rows || []).filter(function(h) { return h.item_code === r.item_code && h.warehouse === r.s_warehouse; });
 		var max = held.length ? this.free_in(r.item_code, r.s_warehouse, held) + flt(r.qty) : null;
+		// Used, not sent: what is on the van (Used from the van) or at the site (Used on site).
+		var said = (CH_SENDS[this.kind] || {}).use ? __('{0} on the van.') : (this.screen === 'use' ? __('{0} at this site.') : __('{0} free to send.'));
 		this.ask(r, {
 			default: r.qty,
 			max: max,
 			max_text: max != null ? __('Only {0} free there.', [ch_amount(max, r.stock_uom)]) : null,
-			info: max != null ? ch_esc(__('{0} free to send.', [ch_amount(max, r.stock_uom)])) : '',
+			info: max != null ? ch_esc(said.replace('{0}', ch_amount(max, r.stock_uom))) : '',
 			action: __('Set')
 		}, (qty) => {
 			r.qty = qty;
@@ -2067,7 +2097,7 @@ class ChStock {
 				purchase_order: o.name,
 				rows: JSON.stringify(lines.map(function(l) { return { po_detail: l.row, qty: counted[l.row] }; })),
 				delivery_note: this.$root.find('[data-dn]').val() || ''
-			}, ch_summary(__('Delivered on {0} by {1}', [site.label, o.supplier]), lines.map(function(l) { return { item_code: l.item_code, item_name: l.item_name, qty: counted[l.row] }; })), { id: id }).then((r) => {
+			}, ch_summary(__('Delivered at {0} by {1}', [site.label, o.supplier]), lines.map(function(l) { return { item_code: l.item_code, item_name: l.item_name, qty: counted[l.row] }; })), { id: id }).then((r) => {
 				this.wrote(r, () => this.done(__('Booked into {0}', [site.label]), r.name + ' · ' + o.name, actions), actions);
 			});
 		});
